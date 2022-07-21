@@ -109,6 +109,9 @@ class Footnote(Enum):
     "(older design) or light brown (newer design). For the newer design, in the interim, choose \"VW J533 Development\" " +
     "from the vehicle drop-down for a harness that integrates at the CAN gateway inside the dashboard.",
     Column.MODEL)
+  VW_VARIANT = CarFootnote(
+    "Includes versions with extra rear cargo space (may be called Variant, Estate, SportWagen, Shooting Brake, etc.)",
+    Column.MODEL)
 
 
 @dataclass
@@ -118,24 +121,42 @@ class VWCarInfo(CarInfo):
 
 
 CAR_INFO: Dict[str, Union[VWCarInfo, List[VWCarInfo]]] = {
-  CAR.ARTEON_MK1: VWCarInfo("Volkswagen Arteon 2018, 2021", footnotes=[Footnote.VW_HARNESS], harness=Harness.j533),
-  CAR.ATLAS_MK1: VWCarInfo("Volkswagen Atlas 2018-19, 2022", footnotes=[Footnote.VW_HARNESS], harness=Harness.j533),
+  CAR.ARTEON_MK1: [
+    VWCarInfo("Volkswagen Arteon 2018-22", footnotes=[Footnote.VW_HARNESS, Footnote.VW_VARIANT], harness=Harness.j533),
+    VWCarInfo("Volkswagen Arteon R 2020-22", footnotes=[Footnote.VW_HARNESS, Footnote.VW_VARIANT], harness=Harness.j533),
+    VWCarInfo("Volkswagen Arteon eHybrid 2020-22", footnotes=[Footnote.VW_HARNESS, Footnote.VW_VARIANT], harness=Harness.j533),
+    VWCarInfo("Volkswagen CC 2018-22", footnotes=[Footnote.VW_HARNESS, Footnote.VW_VARIANT], harness=Harness.j533),
+  ],
+  CAR.ATLAS_MK1: [
+    VWCarInfo("Volkswagen Atlas 2018-22", footnotes=[Footnote.VW_HARNESS], harness=Harness.j533),
+    VWCarInfo("Volkswagen Atlas Cross Sport 2021-22", footnotes=[Footnote.VW_HARNESS], harness=Harness.j533),
+    VWCarInfo("Volkswagen Teramont 2018-22", footnotes=[Footnote.VW_HARNESS], harness=Harness.j533),
+    VWCarInfo("Volkswagen Teramont Cross Sport 2021-22", footnotes=[Footnote.VW_HARNESS], harness=Harness.j533),
+    VWCarInfo("Volkswagen Teramont X 2021-22", footnotes=[Footnote.VW_HARNESS], harness=Harness.j533),
+  ],
   CAR.GOLF_MK7: [
-    VWCarInfo("Volkswagen e-Golf 2014, 2018-20"),
-    VWCarInfo("Volkswagen Golf 2015-20"),
-    VWCarInfo("Volkswagen Golf Alltrack 2017-18"),
-    VWCarInfo("Volkswagen Golf GTE 2016"),
-    VWCarInfo("Volkswagen Golf GTI 2018-21"),
-    VWCarInfo("Volkswagen Golf R 2016-19"),
-    VWCarInfo("Volkswagen Golf SportsVan 2016"),
-    VWCarInfo("Volkswagen Golf SportWagen 2015"),
+    VWCarInfo("Volkswagen e-Golf 2014-20"),
+    VWCarInfo("Volkswagen Golf 2015-20", footnotes=[Footnote.VW_VARIANT]),
+    VWCarInfo("Volkswagen Golf Alltrack 2015-19"),
+    VWCarInfo("Volkswagen Golf GTD 2015-20"),
+    VWCarInfo("Volkswagen Golf GTE 2015-20"),
+    VWCarInfo("Volkswagen Golf GTI 2015-21"),
+    VWCarInfo("Volkswagen Golf R 2015-19", footnotes=[Footnote.VW_VARIANT]),
+    VWCarInfo("Volkswagen Golf SportsVan 2015-20"),
   ],
   CAR.JETTA_MK7: [
-    VWCarInfo("Volkswagen Jetta 2018-21"),
-    VWCarInfo("Volkswagen Jetta GLI 2021"),
+    VWCarInfo("Volkswagen Jetta 2018-22", footnotes=[Footnote.VW_HARNESS], harness=Harness.j533),
+    VWCarInfo("Volkswagen Jetta GLI 2021-22", footnotes=[Footnote.VW_HARNESS], harness=Harness.j533),
   ],
-  CAR.PASSAT_MK8: VWCarInfo("Volkswagen Passat 2015-19", footnotes=[Footnote.PASSAT]),
-  CAR.POLO_MK6: VWCarInfo("Volkswagen Polo 2020"),
+  CAR.PASSAT_MK8: [
+    VWCarInfo("Volkswagen Passat 2015-22", footnotes=[Footnote.VW_HARNESS, Footnote.PASSAT, Footnote.VW_VARIANT], harness=Harness.j533),
+    VWCarInfo("Volkswagen Passat Alltrack 2015-22", footnotes=[Footnote.VW_HARNESS], harness=Harness.j533),
+    VWCarInfo("Volkswagen Passat GTE 2015-22", footnotes=[Footnote.VW_HARNESS, Footnote.VW_VARIANT], harness=Harness.j533),
+  ],
+  CAR.POLO_MK6: [
+    VWCarInfo("Volkswagen Polo 2020-22", footnotes=[Footnote.VW_HARNESS], harness=Harness.j533),
+    VWCarInfo("Volkswagen Polo GTI 2020-22", footnotes=[Footnote.VW_HARNESS], harness=Harness.j533),
+  ],
   CAR.TAOS_MK1: VWCarInfo("Volkswagen Taos 2022", footnotes=[Footnote.VW_HARNESS], harness=Harness.j533),
   CAR.TCROSS_MK1: VWCarInfo("Volkswagen T-Cross 2021", footnotes=[Footnote.VW_HARNESS], harness=Harness.j533),
   CAR.TIGUAN_MK2: VWCarInfo("Volkswagen Tiguan 2019-22", footnotes=[Footnote.VW_HARNESS], harness=Harness.j533),
@@ -245,6 +266,7 @@ FW_VERSIONS = {
       b'\xf1\x8704E906023BN\xf1\x894518',
       b'\xf1\x8704E906024K \xf1\x896811',
       b'\xf1\x8704E906027GR\xf1\x892394',
+      b'\xf1\x8704E906027HD\xf1\x892603',
       b'\xf1\x8704E906027HD\xf1\x893742',
       b'\xf1\x8704E906027MA\xf1\x894958',
       b'\xf1\x8704L906021DT\xf1\x895520',
@@ -282,6 +304,7 @@ FW_VERSIONS = {
     (Ecu.transmission, 0x7e1, None): [
       b'\xf1\x8709G927749AP\xf1\x892943',
       b'\xf1\x8709S927158A \xf1\x893585',
+      b'\xf1\x870CW300040H \xf1\x890606',
       b'\xf1\x870CW300041H \xf1\x891010',
       b'\xf1\x870CW300042F \xf1\x891604',
       b'\xf1\x870CW300043B \xf1\x891601',
@@ -358,6 +381,7 @@ FW_VERSIONS = {
       b'\xf1\x875Q0909144L \xf1\x891021\xf1\x82\x0521A00502A0',
       b'\xf1\x875Q0909144P \xf1\x891043\xf1\x82\00511A00403A0',
       b'\xf1\x875Q0909144R \xf1\x891061\xf1\x82\00516A00604A1',
+      b'\xf1\x875Q0909144S \xf1\x891063\xf1\x82\x0516A00404A1',
       b'\xf1\x875Q0909144S \xf1\x891063\xf1\x82\00516A00604A1',
       b'\xf1\x875Q0909144S \xf1\x891063\xf1\x82\00516A07A02A1',
       b'\xf1\x875Q0909144T \xf1\x891072\xf1\x82\00521A00507A1',
