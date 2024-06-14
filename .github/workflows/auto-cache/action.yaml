@@ -24,26 +24,31 @@ runs:
       with:
         path: ${{ inputs.path }}
 
-    - name: setup github cache
-      if: ${{ !contains(runner.name, 'nsc') && inputs.save != 'false' }}
-      uses: 'actions/cache@v4'
+    - name: Cache var-cache-apt
+      uses: actions/cache@v3
       with:
-        path: ${{ inputs.path }}
-        key: ${{ inputs.key }}
-        restore-keys: ${{ inputs.restore-keys }}
-
-    - name: setup github cache
-      if: ${{ !contains(runner.name, 'nsc') && inputs.save == 'false' }}
-      uses: 'actions/cache/restore@v4'
+        path: var-cache-apt
+        key: var-cache-apt-${{ runner.arch }}-${{ env.CACHE_COMMIT_DATE }}-${{ github.sha }}
+    - name: Cache var-lib-apt
+      uses: actions/cache@v3
       with:
-        path: ${{ inputs.path }}
-        key: ${{ inputs.key }}
-        restore-keys: ${{ inputs.restore-keys }}
+        path: var-lib-apt
+        key: var-lib-apt-${{ runner.arch }}-${{ env.CACHE_COMMIT_DATE }}-${{ github.sha }}
+    - name: inject var-cache-apt into docker
+      uses: reproducible-containers/buildkit-cache-dance@v2.1.2
+      with:
+        cache-source: var-cache-apt
+        cache-target: /var/cache/apt
+    - name: inject var-lib-apt into docker
+      uses: reproducible-containers/buildkit-cache-dance@v2.1.2
+      with:
+        cache-source: var-lib-apt
+        cache-target: /var/lib/apt
 
-    # make the directory manually in case we didn't get a hit, so it doesn't fail on future steps
-    - id: scons-cache-setup
-      shell: bash
-      run: |
-        mkdir -p ${{ inputs.path }}
-        sudo chmod -R 777 ${{ inputs.path }}
-        sudo chown -R $USER ${{ inputs.path }}
+    # # make the directory manually in case we didn't get a hit, so it doesn't fail on future steps
+    # - id: scons-cache-setup
+    #   shell: bash
+    #   run: |
+    #     mkdir -p ${{ inputs.path }}
+    #     sudo chmod -R 777 ${{ inputs.path }}
+    #     sudo chown -R $USER ${{ inputs.path }}
