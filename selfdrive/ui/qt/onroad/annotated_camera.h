@@ -3,6 +3,7 @@
 #include <QVBoxLayout>
 #include <memory>
 #include "selfdrive/ui/qt/onroad/hud.h"
+#include "selfdrive/ui/qt/onroad/model.h"
 #include "selfdrive/ui/qt/onroad/buttons.h"
 #include "selfdrive/ui/qt/onroad/driver_monitoring.h"
 #include "selfdrive/ui/qt/widgets/cameraview.h"
@@ -19,6 +20,7 @@ private:
   ExperimentalButton *experimental_btn;
   DriverMonitorRenderer dmon;
   HudRenderer hud;
+  ModelRenderer modelRender;
   std::unique_ptr<PubMaster> pm;
 
   int skip_frame_count = 0;
