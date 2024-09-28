@@ -1,11 +1,9 @@
 #include "selfdrive/ui/qt/onroad/model.h"
 
-#include <cmath>
+#include <QPainter>
+#include <QWidget>
 
 #include "selfdrive/ui/qt/util.h"
-
-
-ModelRenderer::ModelRenderer() {}
 
 void ModelRenderer::drawLaneLines(SubMaster &sm, const UIScene &scene, QLinearGradient &bg){
       // The first half of track_vertices are the points for the right side of the path
