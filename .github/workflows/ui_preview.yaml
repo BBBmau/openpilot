@@ -62,21 +62,6 @@ jobs:
           path: ${{ github.workspace }}/master_ui
           ref: openpilot_master_ui
 
-      - name: Saving new master ui
-        if: github.ref == 'refs/heads/master' && github.event_name == 'push'
-        working-directory: ${{ github.workspace }}/master_ui
-        run: |
-          git checkout --orphan=new_master_ui
-          git rm -rf *
-          git branch -D openpilot_master_ui
-          git branch -m openpilot_master_ui
-          git config user.name "GitHub Actions Bot"
-          git config user.email "<>"
-          mv ${{ github.workspace }}/pr_ui/*.png .
-          git add .
-          git commit -m "screenshots for commit ${{ env.SHA }}"
-          git push origin openpilot_master_ui --force
-
       - name: Finding diff
         if: github.event_name == 'pull_request_target'
         id: find_diff
