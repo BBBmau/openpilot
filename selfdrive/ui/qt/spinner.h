@@ -10,28 +10,21 @@
 constexpr int spinner_fps = 30;
 constexpr QSize spinner_size = QSize(360, 360);
 
-class TrackWidget : public QWidget  {
-  Q_OBJECT
-public:
-  TrackWidget(QWidget *parent = nullptr);
-
-private:
-  void paintEvent(QPaintEvent *event) override;
-  std::array<QPixmap, spinner_fps> track_imgs;
-  QVariantAnimation m_anim;
-};
+class BodyAnimation;  // Forward declaration
 
 class Spinner : public QWidget {
   Q_OBJECT
 
 public:
-  explicit Spinner(QWidget *parent = 0);
+  explicit Spinner(QWidget *parent = nullptr);
+  void setAwake(bool awake);
+
+private slots:
+  void update(int n);
 
 private:
   QLabel *text;
   QProgressBar *progress_bar;
   QSocketNotifier *notifier;
-
-public slots:
-  void update(int n);
+  BodyAnimation *body_animation;  // Replace TrackWidget with BodyAnimation
 };

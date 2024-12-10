@@ -10,53 +10,57 @@
 #include <QPainter>
 #include <QString>
 #include <QTransform>
+#include <QMovie>
+#include <QLabel>
+#include <QProgressBar>
 
 #include "system/hardware/hw.h"
 #include "selfdrive/ui/qt/qt_window.h"
 #include "selfdrive/ui/qt/util.h"
 
-TrackWidget::TrackWidget(QWidget *parent) : QWidget(parent) {
-  setAttribute(Qt::WA_OpaquePaintEvent);
-  setFixedSize(spinner_size);
+class BodyAnimation : public QWidget {
+  Q_OBJECT
 
-  // pre-compute all the track imgs. make this a gif instead?
-  QPixmap comma_img = loadPixmap("../assets/img_spinner_comma.png", spinner_size);
-  QPixmap track_img = loadPixmap("../assets/img_spinner_track.png", spinner_size);
+public:
+  BodyAnimation(QWidget *parent = nullptr) : QWidget(parent) {
+    setAttribute(Qt::WA_OpaquePaintEvent);
 
-  QTransform transform(1, 0, 0, 1, width() / 2, height() / 2);
-  QPixmap pm(spinner_size);
-  QPainter p(&pm);
-  p.setRenderHint(QPainter::SmoothPixmapTransform);
-  for (int i = 0; i < track_imgs.size(); ++i) {
-    p.resetTransform();
-    p.fillRect(0, 0, spinner_size.width(), spinner_size.height(), Qt::black);
-    p.drawPixmap(0, 0, comma_img);
-    p.setTransform(transform.rotate(360 / spinner_fps));
-    p.drawPixmap(-width() / 2, -height() / 2, track_img);
-    track_imgs[i] = pm.copy();
+    animation_label = new QLabel(this);
+    animation_label->setAlignment(Qt::AlignCenter);
+
+    awake_animation = new QMovie("../assets/body_awake.gif");
+    asleep_animation = new QMovie("../assets/body_asleep.gif");
+
+    animation_label->setMovie(awake_animation);
+    awake_animation->start();
+
+    setFixedSize(awake_animation->frameRect().size());
   }
 
-  m_anim.setDuration(1000);
-  m_anim.setStartValue(0);
-  m_anim.setEndValue(int(track_imgs.size() -1));
-  m_anim.setLoopCount(-1);
-  m_anim.start();
-  connect(&m_anim, SIGNAL(valueChanged(QVariant)), SLOT(update()));
-}
+  void setAwake(bool awake) {
+    animation_label->movie()->stop();
+    if (awake) {
+      animation_label->setMovie(awake_animation);
+      awake_animation->start();
+    } else {
+      animation_label->setMovie(asleep_animation);
+      asleep_animation->start();
+    }
+  }
 
-void TrackWidget::paintEvent(QPaintEvent *event) {
-  QPainter painter(this);
-  painter.drawPixmap(0, 0, track_imgs[m_anim.currentValue().toInt()]);
-}
-
-// Spinner
+private:
+  QLabel *animation_label;
+  QMovie *awake_animation;
+  QMovie *asleep_animation;
+};
 
 Spinner::Spinner(QWidget *parent) : QWidget(parent) {
   QGridLayout *main_layout = new QGridLayout(this);
   main_layout->setSpacing(0);
   main_layout->setMargin(200);
 
-  main_layout->addWidget(new TrackWidget(this), 0, 0, Qt::AlignHCenter | Qt::AlignVCenter);
+  body_animation = new BodyAnimation(this);
+  main_layout->addWidget(body_animation, 0, 0, Qt::AlignHCenter | Qt::AlignVCenter);
 
   text = new QLabel();
   text->setWordWrap(true);
@@ -108,6 +112,12 @@ void Spinner::update(int n) {
     if (number) {
       progress_bar->setValue(std::stoi(line));
     }
+  }
+}
+
+void Spinner::setAwake(bool awake) {
+  if (body_animation) {
+    body_animation->setAwake(awake);
   }
 }
 
