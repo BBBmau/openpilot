@@ -17,12 +17,19 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      pull-requests: write
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/workflows/setup-with-retry
       - name: Update translations
         run: |
           ${{ env.RUN }} "python3 selfdrive/ui/update_translations.py"
-      - uses: stefanzweifel/git-auto-commit-action@v5
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v6
         with:
-          commit_message: "[GHA] Update translations"
+          commit-message: "[GHA] Update translations"
+          title: "Update translations"
+          body: "Automated PR to update translations"
+          branch: "update-translations"
+          base: "master"
+          delete-branch: true
