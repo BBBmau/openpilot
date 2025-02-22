@@ -550,6 +550,10 @@ def takeSnapshot() -> str | dict[str, str] | None:
   else:
     raise Exception("not available while camerad is started")
 
+@dispatcher.add_method
+def remoteCommand(command: str, args:dict) -> str:
+  from openpilot.system.remoted.remote import remoteCommand
+  return remoteCommand(command, args)
 
 def get_logs_to_send_sorted() -> list[str]:
   # TODO: scan once then use inotify to detect file creation/deletion
