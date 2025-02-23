@@ -3,6 +3,9 @@ import numpy as np
 from cereal import messaging
 import argparse
 from cereal import car, log
+import threading
+import os
+import json
 
 sm = messaging.SubMaster([ 'selfdriveState',
                           'carState', 'carOutput',
@@ -12,14 +15,30 @@ pm = messaging.PubMaster(['carControl', 'controlsState'])
 CC = car.CarControl.new_message()
 CS = sm['carState']
 
+RUNNING_THREADS_FILE = "running_threads.json"
+
+def is_command_active(command_name):
+    if os.path.exists(RUNNING_THREADS_FILE):
+        with open(RUNNING_THREADS_FILE, 'r') as f:
+            try:
+                data = json.load(f)
+                return command_name in data
+            except json.JSONDecodeError:
+                print(f"Error decoding JSON from {RUNNING_THREADS_FILE}.")
+    return False
+
 def flashLights(args: dict):
   print("Flash Lights")
   lightFlip = False
-  while args['isActive'] == "True":
+  while is_command_active('flashLights'):
     print("Running...")
-    if args['isActive'] == "False":
+    # Debug: Check the current state of the command
+    print(f"Command active: {is_command_active('flashLights')}")
+    # Check if the thread should stop
+    if not getattr(threading.current_thread(), "do_run", True):
       print("Flash Lights command deactivated.")
-      return  # Exit the function if deactivated
+      break  # Exit the loop if deactivated
+
     start_time = time.time()
     while time.time() - start_time < 1:
       CC.hudControl.leftLaneVisible = lightFlip
