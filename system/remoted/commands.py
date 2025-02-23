@@ -16,14 +16,21 @@ def flashLights(args: dict):
   print("Flash Lights")
   lightFlip = False
   while args['isActive'] == "True":
-    CC.hudControl.leftLaneVisible = lightFlip
-    CC.hudControl.rightLaneVisible = not lightFlip
-    CC.leftBlinker = True
-    CC.rightBlinker = True
-    flash_send = messaging.new_message('carControl')
-    flash_send.valid = CS.canValid
-    flash_send.carControl = CC
-    pm.send('carControl', flash_send)
+   lightFlip = False
+   while args['isActive'] == "True":
+     start_time = time.time()
+     while time.time() - start_time < 1:
+       CC.hudControl.leftLaneVisible = lightFlip
+       CC.hudControl.rightLaneVisible = lightFlip
+       CC.leftBlinker = lightFlip
+       CC.rightBlinker = lightFlip
+       CC.enabled = lightFlip
+       flash_send = messaging.new_message('carControl')
+       flash_send.valid = CS.canValid
+       flash_send.carControl = CC
+       pm.send('carControl', flash_send)
+       print(start_time)
+     lightFlip = not lightFlip
 
 hvac_args = {
   "hvac_auto": bool,
