@@ -16,8 +16,8 @@ def flashLights(args: dict):
   print("Flash Lights")
   lightFlip = False
   while args['isActive'] == "True":
-    CC.leftBlinker = lightFlip
-    CC.rightBlinker = not lightFlip
+    CC.hudControl.leftLaneVisible = lightFlip
+    CC.hudControl.rightLaneVisible = not lightFlip
     flash_send = messaging.new_message('carControl')
     flash_send.valid = CS.canValid
     flash_send.carControl = CC
