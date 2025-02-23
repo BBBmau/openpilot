@@ -16,6 +16,7 @@ def flashLights(args: dict):
   print("Flash Lights")
   lightFlip = False
   while args['isActive'] == "True":
+    print("Running...")
     lightFlip = False
     start_time = time.time()
     while time.time() - start_time < 1:
@@ -29,7 +30,7 @@ def flashLights(args: dict):
       flash_send.carControl = CC
       pm.send('carControl', flash_send)
       print(start_time)
-    lightFlip = not lightFlip
+      lightFlip = not lightFlip
 
 hvac_args = {
   "hvac_auto": bool,
