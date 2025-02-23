@@ -137,11 +137,15 @@
     </message>
     <message>
         <source>Enable ADB</source>
-        <translation>ADBを有効にする</translation>
+        <translation type="vanished">ADBを有効にする</translation>
     </message>
     <message>
         <source>ADB (Android Debug Bridge) allows connecting to your device over USB or over the network. See https://docs.comma.ai/how-to/connect-to-comma for more info.</source>
         <translation>ADB（Android Debug Bridge）により、USBまたはネットワーク経由でデバイスに接続できます。詳細は、https://docs.comma.ai/how-to/connect-to-comma を参照してください。</translation>
+    </message>
+    <message>
+        <source>Enable ADB or not</source>
+        <translation type="unfinished"></translation>
     </message>
 </context>
 <context>
