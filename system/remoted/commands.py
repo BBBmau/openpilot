@@ -17,7 +17,9 @@ def flashLights(args: dict):
   lightFlip = False
   while args['isActive'] == "True":
     print("Running...")
-    lightFlip = False
+    if args['isActive'] == "False":
+      print("Flash Lights command deactivated.")
+      return  # Exit the function if deactivated
     start_time = time.time()
     while time.time() - start_time < 1:
       CC.hudControl.leftLaneVisible = lightFlip
@@ -31,6 +33,10 @@ def flashLights(args: dict):
       pm.send('carControl', flash_send)
       print(start_time)
       lightFlip = not lightFlip
+      time.sleep(0.1)  # Add a small delay to prevent rapid looping
+
+  # Ensure any necessary cleanup here
+  print("Flash Lights command completed or canceled.")
 
 hvac_args = {
   "hvac_auto": bool,
