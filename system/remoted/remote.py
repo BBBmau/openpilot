@@ -6,33 +6,45 @@ from openpilot.common.params import Params
 from openpilot.selfdrive.selfdrived.alertmanager import set_offroad_alert
 import argparse
 
-lock = threading.Lock()
+# Dictionary to keep track of running command threads
+running_threads = {}
 
 # this should contain all the commands that can be run remotely
 def runCommand(command: str, args: dict):
+  def command_thread():
+    try:
+      print(f"Running command: {command} with args: {args}")
+
+      if command in command_map:
+        command_map[command](args)
+      else:
+        print(f"Command {command} not found in command_map.")
+    finally:
+      # Ensure the IsRunningCommand flag is reset after command execution
+      params.put_bool("IsRunningCommand", False)
+      params.remove("Offroad_IsRunningCommand")
+      # Remove the thread from the running_threads dictionary
+      running_threads.pop(command, None)
+
+  params = Params()
+
   # Check if the command is already running and should be canceled
-  if lock.locked() and args['isActive'] == "False":
-    print(f"Cancelling command: {command} as isActive is False")
-    lock.release()
-    return "Lights off"
-
-  # Attempt to acquire the lock to run the command
-  acquired = lock.acquire(blocking=False)
-  if not acquired:
-    print(f"Could not acquire lock for command: {command}")
-    return "Could not acquire lock"
-
-  try:
-    print(f"Running command: {command} with args: {args}")
-
-    if command in command_map:
-      command_map[command](args)
+  if args['isActive'] == "False":
+    if command in running_threads:
+      print(f"Cancelling command: {command} as isActive is False")
+      # Terminate the thread (not directly possible, so we signal it to stop)
+      running_threads[command].do_run = False
+      return "Command cancelled"
     else:
-      print(f"Command {command} not found in command_map.")
-  finally:
-    # Only release the lock if it was acquired
-    if acquired:
-      lock.release()
+      return "No running command to cancel"
+
+  # Start a new thread for the command
+  thread = threading.Thread(target=command_thread)
+  thread.do_run = True  # Custom attribute to control the thread
+  running_threads[command] = thread
+  print("Flash Lights execution started")
+  thread.start()
+  return "runCommand end"
 
 def remoteCommand(command: str, args:dict) -> str:
   params = Params()
@@ -43,16 +55,11 @@ def remoteCommand(command: str, args:dict) -> str:
 
   params.put_bool("IsRunningCommand", True)
   set_offroad_alert("Offroad_IsRunningCommand", True, extra_text=f"{command} {args}")
-  res =runCommand(command, args)
+  res = runCommand(command, args)
   if res is not None:
     return res
-  time.sleep(8.0)  # Give hardwared time to read the param
-
-  params.put_bool("IsRunningCommand", False)
-  params.remove("Offroad_IsRunningCommand")
 
   return "Command Executed!"
-
 
 def main():
   parser = argparse.ArgumentParser(description='Remote command execution.')
@@ -62,7 +69,7 @@ def main():
 
   args = parser.parse_args()
 
-  remoteCommand(args.command, {"isActive": args.isActive})
+  print(remoteCommand(args.command, {"isActive": args.isActive}))
 
 if __name__ == "__main__":
   main()
