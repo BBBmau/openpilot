@@ -169,6 +169,10 @@ class Controls:
     # TODO: both controlsState and carControl valids should be set by
     #       sm.all_checks(), but this creates a circular dependency
 
+
+    CC.leftBlinker = True
+    CC.rightBlinker = True
+
     # controlsState
     dat = messaging.new_message('controlsState')
     dat.valid = CS.canValid

@@ -18,11 +18,12 @@ def flashLights(args: dict):
   while args['isActive'] == "True":
     CC.hudControl.leftLaneVisible = lightFlip
     CC.hudControl.rightLaneVisible = not lightFlip
+    CC.leftBlinker = True
+    CC.rightBlinker = True
     flash_send = messaging.new_message('carControl')
     flash_send.valid = CS.canValid
     flash_send.carControl = CC
     pm.send('carControl', flash_send)
-    time.sleep(1)
 
 hvac_args = {
   "hvac_auto": bool,
