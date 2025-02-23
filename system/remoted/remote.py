@@ -8,16 +8,25 @@ from openpilot.selfdrive.selfdrived.alertmanager import set_offroad_alert
 lock = threading.Lock()
 
 # this should contain all the commands that can be run remotely
-def runCommand(command: str, args:dict):
+def runCommand(command: str, args: dict):
+  # Check if the command is already running and should be canceled
   if lock.locked() and args['isActive'] == "False":
+    print(f"Cancelling command: {command} as isActive is False")
     lock.release()
-  with lock:
+    return
+
+  # Acquire the lock to run the command
+  lock.acquire()
+  try:
     print(f"Running command: {command} with args: {args}")
 
     if command in command_map:
       command_map[command](args)
     else:
-      pass
+      print(f"Command {command} not found in command_map.")
+  finally:
+    # Always release the lock in the finally block
+    lock.release()
 
 def remoteCommand(command: str, args:dict) -> str:
   params = Params()
