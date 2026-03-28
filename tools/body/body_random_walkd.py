@@ -2,8 +2,8 @@
 """
 On-device Gymnasium-style random walk for comma body using bodyjim → localhost webrtcd.
 
-Runs only while manager has the stack *onroad* for a notCar platform (same ``started`` signal as
-``joystickd`` / ``webrtcd`` — typically when ignition is on and startup conditions pass).
+Runs for a notCar platform while manager sees panda **ignition** or full **onroad**
+(``deviceState.started``). Ignition alone is enough even when startup conditions block ``started``.
 
 Requires the ``bodyjim`` package on the device::
 

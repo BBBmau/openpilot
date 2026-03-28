@@ -73,8 +73,14 @@ def bodywaked_should_run(started: bool, params: Params, CP: car.CarParams) -> bo
 
 
 def body_random_walk_should_run(started: bool, params: Params, CP: car.CarParams) -> bool:
-  """Local bodyjim random walk while onroad; see tools/body/body_random_walkd.py."""
-  return notcar(started, params, CP) and params.get_bool("BodyRandomWalkEnabled")
+  """Comma body only: random walk when ignition is on or full onroad (deviceState.started).
+
+  ``started`` alone is often false while ignition is on (startup blocked, temp, etc.); ``LiveIgnition``
+  mirrors panda ignition so the daemon matches the usual \"ignition on\" expectation.
+  """
+  if not params.get_bool("BodyRandomWalkEnabled") or not CP.notCar:
+    return False
+  return started or params.get_bool("LiveIgnition")
 
 def only_offroad(started: bool, params: Params, CP: car.CarParams) -> bool:
   return not started
