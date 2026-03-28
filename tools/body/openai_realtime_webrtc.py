@@ -52,12 +52,28 @@ from openpilot.system.webrtc.device.audio import (
   BODY_REALTIME_PCM_SERVICE,
   BodyMicAudioTrack,
   BodySpeaker,
+  SPEAKER_SAMPLE_RATE,
 )
 
 REALTIME_CALLS_URL = "https://api.openai.com/v1/realtime/calls"
 ICE_GATHER_TIMEOUT_S = 30.0
 LOG = logging.getLogger("openai_realtime_webrtc")
 MIC_LOG_INTERVAL = 50
+
+# Matches ``selfdrive/ui/soundd.py`` SAMPLE_RATE / ``feed_webrtc_pcm`` (non-48kHz PCM is dropped).
+_soundd_sr_mismatch_logged = False
+
+
+def _soundd_body_realtime_sample_rate_check(published_hz: int) -> None:
+  global _soundd_sr_mismatch_logged
+  if published_hz == SPEAKER_SAMPLE_RATE or _soundd_sr_mismatch_logged:
+    return
+  _soundd_sr_mismatch_logged = True
+  LOG.warning(
+    "bodyRealtimeAudioData sampleRate %d != soundd %d; feed_webrtc_pcm ignores non-48kHz PCM (no downlink audio)",
+    published_hz,
+    SPEAKER_SAMPLE_RATE,
+  )
 
 
 class _DebugMicTrack(BodyMicAudioTrack):
@@ -240,7 +256,11 @@ async def run_session(
   def _on_dc_message(message: str | bytes) -> None:
     on_dc_message(message)
 
-  speaker = BodySpeaker(pcm_service=BODY_REALTIME_PCM_SERVICE, pcm_gain=playback_gain)
+  speaker = BodySpeaker(
+    pcm_service=BODY_REALTIME_PCM_SERVICE,
+    pcm_gain=playback_gain,
+    on_publish_sample_rate=_soundd_body_realtime_sample_rate_check,
+  )
   audio_to_speaker_started = False
 
   @pc.on("track")

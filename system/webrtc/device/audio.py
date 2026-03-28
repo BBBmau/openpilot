@@ -4,6 +4,7 @@ import logging
 import threading
 import time
 from collections import deque
+from typing import Callable
 
 import numpy as np
 from av import AudioFrame
@@ -142,9 +143,16 @@ class BodyMicAudioTrack(AudioStreamTrack):
 
 
 class BodySpeaker:
-  def __init__(self, pcm_service: str = "webrtcAudioData", pcm_gain: float = 1.0):
+  def __init__(
+    self,
+    pcm_service: str = "webrtcAudioData",
+    pcm_gain: float = 1.0,
+    on_publish_sample_rate: Callable[[int], None] | None = None,
+  ):
     self._pcm_service = pcm_service
     self._pcm_gain = float(pcm_gain)
+    self._on_publish_sample_rate = on_publish_sample_rate
+    self._bad_sr_logged = False
     self._pm = messaging.PubMaster(["soundRequest", pcm_service])
     self._task: asyncio.Task | None = None
 
@@ -179,8 +187,18 @@ class BodySpeaker:
             v = pcm.astype(np.float32) * self._pcm_gain
             np.clip(v, -32768, 32767, out=v)
             pcm = v.astype(np.int16)
+          out_sr = int(resampled.sample_rate)
           ad.data = np.ascontiguousarray(pcm).tobytes()
-          ad.sampleRate = SPEAKER_SAMPLE_RATE
+          ad.sampleRate = out_sr
+          if self._on_publish_sample_rate is not None:
+            self._on_publish_sample_rate(out_sr)
+          elif out_sr != SPEAKER_SAMPLE_RATE and not self._bad_sr_logged:
+            logger.warning(
+              "BodySpeaker: resampled sample_rate=%s != soundd expected %s; feed_webrtc_pcm will ignore audio",
+              out_sr,
+              SPEAKER_SAMPLE_RATE,
+            )
+            self._bad_sr_logged = True
           self._pm.send(svc, msg)
     except MediaStreamError:
       logger.info("Incoming browser audio track ended")
