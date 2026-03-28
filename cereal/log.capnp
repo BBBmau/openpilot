@@ -2515,6 +2515,11 @@ struct SoundRequest {
 # soundd: mono float32 PCM queued for PortAudio (webrtcAudioData + bodyRealtimeAudioData).
 struct SounddWebrtcQueueState {
   queuedSamples @0 :Int32;
+  # Samples queued from bodyRealtimeAudioData only (OpenAI Realtime / body tools). ``queuedSamples``
+  # is the full WebRTC deque including webrtcAudioData (webrtcd), which may never hit “empty”.
+  bodyRealtimeQueuedSamples @1 :Int32;
+  # True when soundd publishes per-source counts (new builds). Absent/false = legacy combined queue only.
+  hasSplitTelemetry @2 :Bool;
 }
 
 struct Touch {

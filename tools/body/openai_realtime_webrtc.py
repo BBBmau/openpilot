@@ -46,8 +46,8 @@ only after a successful send caused echo loops on body speakers). Server events
 Mute holds from there through ``response.done`` plus the timing floor / optional soundd drain below.
 After ``response.done``, the client keeps the uplink off until an **API timing floor** (minimum hold
 after ``response.done``, ``response.output_audio_transcript.done``, and ``response.output_audio.done``)
-and, when ``soundd`` publishes ``sounddWebrtcQueueState`` (default on), until **soundd’s WebRTC/body
-PCM queue** has stayed at/below ``--soundd-queue-nonempty-epsilon-samples`` for
+and, when ``soundd`` publishes ``sounddWebrtcQueueState`` (default on), until **the relevant PCM queue
+depth** has stayed at/below ``--soundd-queue-nonempty-epsilon-samples`` for
 ``--soundd-stable-empty-ms`` plus ``--soundd-post-drain-hangover`` (room / OS buffer tail). If that
 telemetry is missing, the API floor alone applies. Defaults favor **lower latency**; if the mic
 picks up tail audio and retriggers, raise ``--half-duplex-min-after-response-done`` /
@@ -151,6 +151,8 @@ class _SounddQueueWatcher:
   def __init__(self) -> None:
     self._lock = threading.Lock()
     self._queued_samples = 0
+    self._body_queued_samples = 0
+    self._has_split_telemetry = False
     self._seen = False
     self._alive = False
     self._stop = threading.Event()
@@ -162,7 +164,10 @@ class _SounddQueueWatcher:
       while not self._stop.is_set():
         sm.update(50)
         with self._lock:
-          self._queued_samples = int(sm["sounddWebrtcQueueState"].queuedSamples)
+          st = sm["sounddWebrtcQueueState"]
+          self._queued_samples = int(st.queuedSamples)
+          self._body_queued_samples = int(getattr(st, "bodyRealtimeQueuedSamples", 0) or 0)
+          self._has_split_telemetry = bool(getattr(st, "hasSplitTelemetry", False))
           self._seen = sm.seen["sounddWebrtcQueueState"]
           self._alive = sm.all_alive(["sounddWebrtcQueueState"])
 
@@ -183,6 +188,17 @@ class _SounddQueueWatcher:
     with self._lock:
       return self._queued_samples
 
+  def gate_queue_depth_samples(self) -> int:
+    """Depth used for half-duplex drain: body-only when soundd publishes split telemetry, else combined."""
+    with self._lock:
+      if self._has_split_telemetry:
+        return self._body_queued_samples
+      return self._queued_samples
+
+  def gate_uses_body_split(self) -> bool:
+    with self._lock:
+      return self._has_split_telemetry
+
 
 class _ResponseHalfDuplexGate:
   """Event-driven uplink mute: entire assistant response, then API timing floor + optional soundd queue drain.
@@ -190,7 +206,12 @@ class _ResponseHalfDuplexGate:
   Soundd queue gating is armed only in ``on_response_done`` so idle listening is not muted by
   unrelated PCM in soundd’s webrtc deque or by stable-empty/hangover on startup.
 
-  The deque can sit at a small steady backlog (RTP vs. soundd callback rate), so “drained” uses a
+  When soundd publishes ``hasSplitTelemetry`` + ``bodyRealtimeQueuedSamples`` (current soundd), the
+  gate drains **only** the ``bodyRealtimeAudioData`` portion of the deque. The combined
+  ``queuedSamples`` also includes ``webrtcAudioData`` (e.g. webrtcd), which can hold a steady backlog
+  so the queue never looked “empty” and the mic stayed off too long.
+
+  The deque can still sit at a small steady backlog for the path we measure, so “drained” uses a
   sample epsilon below which we treat the queue as empty, plus an optional max wait fallback.
   """
 
@@ -249,17 +270,21 @@ class _ResponseHalfDuplexGate:
       and self._soundd_queue is not None
       and self._soundd_queue.telemetry_ok()
     ):
-      q = self._soundd_queue.queued_samples()
+      q = self._soundd_queue.gate_queue_depth_samples()
       if (
         self._soundd_max_drain_wait_s > 0.0
         and self._soundd_drain_deadline is not None
         and now >= self._soundd_drain_deadline
       ):
         if not self._soundd_drain_timeout_logged:
+          qt = self._soundd_queue.queued_samples()
           LOG.warning(
-            "soundd speaker gate: drain wait exceeded %.1fs (queuedSamples=%d); forcing uplink unmute",
+            "soundd speaker gate: drain wait exceeded %.1fs (gate_depth=%d total_queuedSamples=%d "
+            "body_split=%s); forcing uplink unmute",
             self._soundd_max_drain_wait_s,
             q,
+            qt,
+            self._soundd_queue.gate_uses_body_split(),
           )
           self._soundd_drain_timeout_logged = True
         result = False
@@ -690,8 +715,9 @@ async def run_session(
     if soundd_watcher is not None:
       LOG.info(
         "half-duplex uplink: mute through each response; after API floor (max response.done+%.2fs, "
-        "transcript.done+%.2fs, output_audio.done+%.2fs), also wait for soundd queue drain "
-        "(queuedSamples<=%d treated empty, stable %.0fms + %.2fs hangover; max wait %.1fs from response.done)",
+        "transcript.done+%.2fs, output_audio.done+%.2fs), also wait for soundd drain "
+        "(gate depth: bodyRealtimeQueuedSamples when soundd hasSplitTelemetry else combined "
+        "queuedSamples; <=%d treated empty, stable %.0fms + %.2fs hangover; max wait %.1fs from response.done)",
         half_duplex_after_response_done_min_s,
         half_duplex_after_transcript_s,
         half_duplex_after_audio_s,
@@ -1210,7 +1236,8 @@ def main() -> None:
     "--soundd-speaker-gate/--no-soundd-speaker-gate",
     dest="soundd_speaker_gate",
     default=True,
-    help="With half-duplex, keep uplink muted until soundd’s webrtc PCM queue is drained (sounddWebrtcQueueState); "
+    help="With half-duplex, keep uplink muted until soundd’s PCM gate depth is drained (sounddWebrtcQueueState: "
+    "bodyRealtimeQueuedSamples when hasSplitTelemetry, else combined queue); "
     "falls back to API-only timing if telemetry is absent (default on)",
   )
   parser.add_argument(
@@ -1232,7 +1259,8 @@ def main() -> None:
     type=int,
     default=7200,
     metavar="N",
-    help="With --soundd-speaker-gate, treat queuedSamples<=N as empty (~7200≈150ms at 48kHz; 0=strict q==0)",
+    help="With --soundd-speaker-gate, treat gate depth<=N as empty (~7200≈150ms at 48kHz; 0=strict; "
+    "gate depth is body-only when soundd publishes hasSplitTelemetry)",
   )
   parser.add_argument(
     "--soundd-max-drain-wait",

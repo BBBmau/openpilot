@@ -32,6 +32,13 @@ fields and triggered a ``KeyError``. Use a current ``webrtcd`` that sends the fu
 On device: ``curl -sS 'http://127.0.0.1:5001/schema?services=' | head`` and confirm **manager** shows ``webrtcd`` green.
 
 Set env **BODY_RANDOM_WALK_VERBOSE=1** for full tracebacks on each failed attempt (noisy).
+
+**``BodyEnv.reset`` → ``TimeoutError``** (often with an empty message): bodyjim’s first
+``receive()`` waits only **2s** by default for decoded camera frames. On-device WebRTC + H.264
+often need longer until the first keyframe. This script raises
+``BODY_RANDOM_WALK_RECEIVE_TIMEOUT`` (default **15** seconds) on ``bodyjim.data_stream`` before
+importing ``BodyEnv``. Override with e.g. ``export BODY_RANDOM_WALK_RECEIVE_TIMEOUT=30``.
+Optional ``BODY_RANDOM_WALK_CONNECT_TIMEOUT`` overrides the 3s WebRTC connect wait.
 """
 from __future__ import annotations
 
@@ -47,6 +54,33 @@ from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
 
 _VERBOSE = os.environ.get("BODY_RANDOM_WALK_VERBOSE", "").strip().lower() in ("1", "true", "yes")
+
+
+def _patch_bodyjim_timeouts() -> None:
+  """bodyjim uses 2s receive / 3s connect; first video frame on comma body often needs more."""
+  import bodyjim.data_stream as ds  # noqa: PLC0415
+
+  recv = os.environ.get("BODY_RANDOM_WALK_RECEIVE_TIMEOUT", "15").strip()
+  if recv:
+    try:
+      v = float(recv)
+      if v > 0:
+        ds.RECEIVE_TIMEOUT_SECONDS = v
+    except ValueError:
+      cloudlog.warning("body_random_walkd: invalid BODY_RANDOM_WALK_RECEIVE_TIMEOUT=%r", recv)
+  conn = os.environ.get("BODY_RANDOM_WALK_CONNECT_TIMEOUT", "").strip()
+  if conn:
+    try:
+      v = float(conn)
+      if v > 0:
+        ds.CONNECT_TIMEOUT_SECONDS = v
+    except ValueError:
+      cloudlog.warning("body_random_walkd: invalid BODY_RANDOM_WALK_CONNECT_TIMEOUT=%r", conn)
+  cloudlog.info(
+    "body_random_walkd: bodyjim timeouts receive=%.1fs connect=%.1fs",
+    ds.RECEIVE_TIMEOUT_SECONDS,
+    ds.CONNECT_TIMEOUT_SECONDS,
+  )
 
 
 def _log_connect_failure(stage: str, err: BaseException) -> None:
@@ -101,6 +135,7 @@ def main() -> None:
   BodyEnv = None
   while BodyEnv is None and not stop:
     try:
+      _patch_bodyjim_timeouts()
       from bodyjim import BodyEnv as _BodyEnv  # noqa: PLC0415
 
       BodyEnv = _BodyEnv

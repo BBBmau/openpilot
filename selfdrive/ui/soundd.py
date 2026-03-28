@@ -80,14 +80,18 @@ class Soundd:
     self.spl_filter_weighted = FirstOrderFilter(0, 2.5, FILTER_DT, initialized=False)
 
     self._webrtc_lock = threading.Lock()
-    self._webrtc_chunks: deque[np.ndarray] = deque()
+    # (source, float32 mono chunk). source "body" = bodyRealtimeAudioData; "webrtc" = webrtcAudioData.
+    self._webrtc_chunks: deque[tuple[str, np.ndarray]] = deque()
     self._webrtc_sr_warned = False
     self._pm_queue = messaging.PubMaster(["sounddWebrtcQueueState"])
 
   def _webrtc_queued_samples(self) -> int:
-    return sum(c.shape[0] for c in self._webrtc_chunks)
+    return sum(c.shape[0] for _, c in self._webrtc_chunks)
 
-  def feed_webrtc_pcm(self, pcm_int16: np.ndarray, sample_rate: int) -> None:
+  def _webrtc_body_queued_samples(self) -> int:
+    return sum(c.shape[0] for t, c in self._webrtc_chunks if t == "body")
+
+  def feed_webrtc_pcm(self, pcm_int16: np.ndarray, sample_rate: int, *, source: str = "webrtc") -> None:
     if pcm_int16.size == 0:
       return
     if sample_rate != SAMPLE_RATE:
@@ -99,14 +103,14 @@ class Soundd:
     with self._webrtc_lock:
       while self._webrtc_queued_samples() > MAX_WEBRTC_QUEUED_SAMPLES and self._webrtc_chunks:
         self._webrtc_chunks.popleft()
-      self._webrtc_chunks.append(fl)
+      self._webrtc_chunks.append((source, fl))
 
   def take_webrtc(self, frames: int) -> np.ndarray:
     out = np.zeros(frames, dtype=np.float32)
     taken = 0
     with self._webrtc_lock:
       while taken < frames and self._webrtc_chunks:
-        chunk = self._webrtc_chunks[0]
+        tag, chunk = self._webrtc_chunks[0]
         need = frames - taken
         if chunk.shape[0] <= need:
           out[taken:taken + chunk.shape[0]] = chunk
@@ -114,7 +118,7 @@ class Soundd:
           self._webrtc_chunks.popleft()
         else:
           out[taken:taken + need] = chunk[:need]
-          self._webrtc_chunks[0] = chunk[need:]
+          self._webrtc_chunks[0] = (tag, chunk[need:])
           taken = frames
     return out
 
@@ -182,13 +186,13 @@ class Soundd:
       raw = wa.data
       if len(raw) > 0:
         pcm = np.frombuffer(raw, dtype=np.int16).copy()
-        self.feed_webrtc_pcm(pcm, int(wa.sampleRate))
+        self.feed_webrtc_pcm(pcm, int(wa.sampleRate), source="webrtc")
     for ev in messaging.drain_sock(body_sock, wait_for_one=False):
       br = ev.bodyRealtimeAudioData
       raw = br.data
       if len(raw) > 0:
         pcm = np.frombuffer(raw, dtype=np.int16).copy()
-        self.feed_webrtc_pcm(pcm, int(br.sampleRate))
+        self.feed_webrtc_pcm(pcm, int(br.sampleRate), source="body")
 
   def get_audible_alert(self, sm):
     if sm.updated['soundRequest']:
@@ -236,8 +240,11 @@ class Soundd:
         self._drain_live_pcm(webrtc_pcm_sock, body_pcm_sock)
 
         q = self._webrtc_queued_samples()
+        qb = self._webrtc_body_queued_samples()
         msg = messaging.new_message("sounddWebrtcQueueState", valid=True)
         msg.sounddWebrtcQueueState.queuedSamples = int(min(q, 2**31 - 1))
+        msg.sounddWebrtcQueueState.bodyRealtimeQueuedSamples = int(min(qb, 2**31 - 1))
+        msg.sounddWebrtcQueueState.hasSplitTelemetry = True
         self._pm_queue.send("sounddWebrtcQueueState", msg)
 
         if sm.updated['soundPressure'] and self.current_alert == AudibleAlert.none: # only update volume filter when not playing alert
