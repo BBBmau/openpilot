@@ -75,6 +75,10 @@ docs = [
   "mkdocs",
 ]
 
+bodyjim = [
+  "bodyjim>=1.0.3",
+]
+
 testing = [
   "coverage",
   "hypothesis ==6.47.*",

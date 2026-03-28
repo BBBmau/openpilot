@@ -71,6 +71,11 @@ def soundd_should_run(started: bool, params: Params, CP: car.CarParams) -> bool:
 def bodywaked_should_run(started: bool, params: Params, CP: car.CarParams) -> bool:
   return CP.notCar and params.get_bool("BodyWakeWordEnabled")
 
+
+def body_random_walk_should_run(started: bool, params: Params, CP: car.CarParams) -> bool:
+  """Local bodyjim random walk while onroad; see tools/body/body_random_walkd.py."""
+  return notcar(started, params, CP) and params.get_bool("BodyRandomWalkEnabled")
+
 def only_offroad(started: bool, params: Params, CP: car.CarParams) -> bool:
   return not started
 
@@ -131,6 +136,7 @@ procs = [
   # debug procs
   NativeProcess("bridge", "cereal/messaging", ["./bridge"], notcar),
   PythonProcess("webrtcd", "system.webrtc.webrtcd", notcar),
+  PythonProcess("bodyrandomwalkd", "tools.body.body_random_walkd", body_random_walk_should_run),
   PythonProcess("joystick", "tools.joystick.joystick_control", and_(joystick, iscar)),
 ]
 
