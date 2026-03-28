@@ -178,8 +178,11 @@ class BodySpeaker:
           ad = getattr(msg, svc)
           pcm = resampled.to_ndarray()
           if pcm.ndim > 1:
-            # Planar stereo from the decoder/resampler: average to mono (reshape would interleave wrongly).
-            if pcm.shape[0] == 2:
+            # Downmix to mono: planar is (2, samples); packed/interleaved is (samples, 2).
+            # reshape(-1) on interleaved stereo would treat L,R,L,R as one channel → harsh comb/filtered distortion.
+            if pcm.shape[1] == 2:
+              pcm = pcm.mean(axis=1).astype(np.int16)
+            elif pcm.shape[0] == 2:
               pcm = pcm.mean(axis=0).astype(np.int16)
             else:
               pcm = pcm.reshape(-1)

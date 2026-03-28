@@ -168,6 +168,27 @@ class Soundd:
       self.current_alert = new_alert
       self.current_sound_frame = 0
 
+  def _drain_live_pcm(self, webrtc_sock, body_sock) -> None:
+    """Move every pending PCM chunk into the playback deque.
+
+    SubMaster uses conflate=True on all services, which keeps only the *latest* message per socket
+    between polls — fine for state, but it drops most audio frames when the producer outruns our
+    poll rate. Live PCM uses dedicated subscribers with conflate=False plus drain_sock so chunks
+    are fed in order and the PortAudio callback sees a steadier queue.
+    """
+    for ev in messaging.drain_sock(webrtc_sock, wait_for_one=False):
+      wa = ev.webrtcAudioData
+      raw = wa.data
+      if len(raw) > 0:
+        pcm = np.frombuffer(raw, dtype=np.int16).copy()
+        self.feed_webrtc_pcm(pcm, int(wa.sampleRate))
+    for ev in messaging.drain_sock(body_sock, wait_for_one=False):
+      br = ev.bodyRealtimeAudioData
+      raw = br.data
+      if len(raw) > 0:
+        pcm = np.frombuffer(raw, dtype=np.int16).copy()
+        self.feed_webrtc_pcm(pcm, int(br.sampleRate))
+
   def get_audible_alert(self, sm):
     if sm.updated['soundRequest']:
       new_alert = sm['soundRequest'].sound.raw
@@ -199,28 +220,19 @@ class Soundd:
     # sounddevice must be imported after forking processes
     import sounddevice as sd
 
-    sm = messaging.SubMaster(
-      ['selfdriveState', 'soundPressure', 'soundRequest', 'webrtcAudioData', 'bodyRealtimeAudioData']
-    )
+    sm = messaging.SubMaster(['selfdriveState', 'soundPressure', 'soundRequest'], poll='selfdriveState')
+    webrtc_pcm_sock = messaging.sub_sock('webrtcAudioData', conflate=False)
+    body_pcm_sock = messaging.sub_sock('bodyRealtimeAudioData', conflate=False)
 
     with self.get_stream(sd) as stream:
-      rk = Ratekeeper(20)
+      # Faster than 20 Hz so we pull msgq → deque closer to real time; callback still drains at a
+      # fixed ~blocksize / SAMPLE_RATE, but feeding was ~50 ms apart and conflate hid dropped frames.
+      rk = Ratekeeper(100)
 
       cloudlog.info(f"soundd stream started: {stream.samplerate=} {stream.channels=} {stream.dtype=} {stream.device=}, {stream.blocksize=}")
       while True:
         sm.update(0)
-
-        if sm.updated['webrtcAudioData']:
-          raw = sm['webrtcAudioData'].data
-          if len(raw) > 0:
-            pcm = np.frombuffer(raw, dtype=np.int16).copy()
-            self.feed_webrtc_pcm(pcm, int(sm['webrtcAudioData'].sampleRate))
-
-        if sm.updated['bodyRealtimeAudioData']:
-          raw = sm['bodyRealtimeAudioData'].data
-          if len(raw) > 0:
-            pcm = np.frombuffer(raw, dtype=np.int16).copy()
-            self.feed_webrtc_pcm(pcm, int(sm['bodyRealtimeAudioData'].sampleRate))
+        self._drain_live_pcm(webrtc_pcm_sock, body_pcm_sock)
 
         if sm.updated['soundPressure'] and self.current_alert == AudibleAlert.none: # only update volume filter when not playing alert
           self.spl_filter_weighted.update(sm["soundPressure"].soundPressureWeightedDb)
