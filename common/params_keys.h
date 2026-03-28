@@ -38,7 +38,6 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"DoUninstall", {CLEAR_ON_MANAGER_START, BOOL}},
     {"DriverTooDistracted", {CLEAR_ON_MANAGER_START | CLEAR_ON_IGNITION_ON, BOOL}},
     {"AlphaLongitudinalEnabled", {PERSISTENT | DEVELOPMENT_ONLY, BOOL}},
-    {"BodyRandomWalkEnabled", {PERSISTENT, BOOL, "1"}},
     {"BodyRandomWalkHumanRender", {PERSISTENT, BOOL, "1"}},
     {"BodyVoiceAssistantActive", {CLEAR_ON_OFFROAD_TRANSITION, BOOL}},
     {"BodyWakeWordEnabled", {PERSISTENT, BOOL}},
