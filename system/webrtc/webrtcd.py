@@ -404,7 +404,11 @@ async def get_stream(request: 'web.Request'):
     stream_dict[session.identifier] = session
 
     active_camera = getattr(session.video_track, '_camera_type', 'driver')
-    response = web.json_response({"sdp": answer.sdp, "type": answer.type, "activeCamera": active_camera})
+    # Only sdp + type in JSON: clients (e.g. bodyjim) often do RTCSessionDescription(**response.json()).
+    # activeCamera is also sent on the data channel after connect; expose here for HTTP-only callers via header.
+    response = web.json_response({"sdp": answer.sdp, "type": answer.type})
+    response.headers["X-Openpilot-Active-Camera"] = active_camera
+    response.headers["Access-Control-Expose-Headers"] = "X-Openpilot-Active-Camera"
     _add_cors_headers(request, response)
     return response
   except web.HTTPException:

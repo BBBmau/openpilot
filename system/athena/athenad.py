@@ -581,7 +581,11 @@ def startJoystickStream(sdp: str) -> dict:
         raise Exception(error_body.get("message", f"webrtcd returned {resp.status_code}"))
       except ValueError:
         resp.raise_for_status()
-    return resp.json()
+    data = resp.json()
+    ac = resp.headers.get("X-Openpilot-Active-Camera")
+    if ac:
+      data["activeCamera"] = ac
+    return data
   except requests.ConnectTimeout:
     raise Exception("webrtc took too long to respond. is it on?") from None
   except requests.ConnectionError:
