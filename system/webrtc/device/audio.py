@@ -148,10 +148,12 @@ class BodySpeaker:
     pcm_service: str = "webrtcAudioData",
     pcm_gain: float = 1.0,
     on_publish_sample_rate: Callable[[int], None] | None = None,
+    on_downlink_pcm: Callable[[np.ndarray], None] | None = None,
   ):
     self._pcm_service = pcm_service
     self._pcm_gain = float(pcm_gain)
     self._on_publish_sample_rate = on_publish_sample_rate
+    self._on_downlink_pcm = on_downlink_pcm
     self._bad_sr_logged = False
     self._pm = messaging.PubMaster(["soundRequest", pcm_service])
     self._task: asyncio.Task | None = None
@@ -193,6 +195,8 @@ class BodySpeaker:
           out_sr = int(resampled.sample_rate)
           ad.data = np.ascontiguousarray(pcm).tobytes()
           ad.sampleRate = out_sr
+          if self._on_downlink_pcm is not None:
+            self._on_downlink_pcm(pcm)
           if self._on_publish_sample_rate is not None:
             self._on_publish_sample_rate(out_sr)
           elif out_sr != SPEAKER_SAMPLE_RATE and not self._bad_sr_logged:
