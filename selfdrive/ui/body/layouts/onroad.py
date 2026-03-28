@@ -76,8 +76,9 @@ class BodyLayout(Widget):
   def _update_state(self):
     sm = ui_state.sm
 
-    active = ui_state.is_onroad()
-    if active and ui_state.joystick_debug_mode:
+    body_interactive = ui_state.joystick_debug_mode or ui_state.body_voice_session
+    active = ui_state.is_onroad() or ui_state.body_voice_session
+    if active and body_interactive:
       if not self._was_active:
         self._last_input_time = time.monotonic()
         self._was_active = True
@@ -99,7 +100,7 @@ class BodyLayout(Widget):
       return
 
     steer = sm['testJoystick'].axes[1] if len(sm['testJoystick'].axes) > 1 else 0
-    is_v2 = sm['carParams'].carFingerprint == CAR.COMMA_BODY_V2
+    is_v2 = sm['carParams'].carFingerprint == CAR.COMMA_BODY
     if is_v2:
       self._turning_left = steer <= -0.05
       self._turning_right = steer >= 0.05

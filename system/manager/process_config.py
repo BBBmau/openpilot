@@ -52,6 +52,14 @@ def always_run(started: bool, params: Params, CP: car.CarParams) -> bool:
 def only_onroad(started: bool, params: Params, CP: car.CarParams) -> bool:
   return started
 
+def micd_onroad_or_body(started: bool, params: Params, CP: car.CarParams) -> bool:
+  """Comma body needs the mic while nominally offroad so wake-word can bring the UI 'onroad'."""
+  return started or CP.notCar
+
+
+def bodywaked_should_run(started: bool, params: Params, CP: car.CarParams) -> bool:
+  return CP.notCar and params.get_bool("BodyWakeWordEnabled")
+
 def only_offroad(started: bool, params: Params, CP: car.CarParams) -> bool:
   return not started
 
@@ -73,7 +81,8 @@ procs = [
   PythonProcess("webcamerad", "tools.webcam.camerad", driverview, enabled=WEBCAM),
   PythonProcess("proclogd", "system.proclogd", only_onroad, enabled=platform.system() != "Darwin"),
   PythonProcess("journald", "system.journald", only_onroad, platform.system() != "Darwin"),
-  PythonProcess("micd", "system.micd", only_onroad),
+  PythonProcess("micd", "system.micd", micd_onroad_or_body),
+  PythonProcess("bodywaked", "selfdrive.ui.body.bodywaked", bodywaked_should_run),
   PythonProcess("timed", "system.timed", always_run, enabled=not PC),
 
   PythonProcess("modeld", "selfdrive.modeld.modeld", only_onroad),

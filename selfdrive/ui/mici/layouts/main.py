@@ -26,6 +26,7 @@ class MiciMainLayout(Scroller):
     self._prev_onroad = False
     self._prev_standstill = False
     self._prev_joystick_debug_mode = False
+    self._prev_body_voice_session = False
     self._onroad_time_delay: float | None = None
     self._setup = False
 
@@ -101,7 +102,7 @@ class MiciMainLayout(Scroller):
 
     # FIXME: these two pops can interrupt user interacting in the settings
     if self._onroad_time_delay is not None and rl.get_time() - self._onroad_time_delay >= ONROAD_DELAY:
-      if not self._is_body or ui_state.joystick_debug_mode:
+      if not self._is_body or ui_state.joystick_debug_mode or ui_state.body_voice_session:
         gui_app.pop_widgets_to(self, lambda: self._scroll_to(self._onroad_layout))
       self._onroad_time_delay = None
 
@@ -114,12 +115,15 @@ class MiciMainLayout(Scroller):
     # On body, react to joystick debug mode changes while onroad:
     # - Connected (False->True): scroll to onroad to show awake face
     # - Disconnected (True->False): scroll to home so user can reconnect
-    if self._is_body and ui_state.joystick_debug_mode != self._prev_joystick_debug_mode:
-      if ui_state.joystick_debug_mode:
+    body_interactive = ui_state.joystick_debug_mode or ui_state.body_voice_session
+    prev_interactive = self._prev_joystick_debug_mode or self._prev_body_voice_session
+    if self._is_body and body_interactive != prev_interactive:
+      if body_interactive:
         gui_app.pop_widgets_to(self, lambda: self._scroll_to(self._onroad_layout))
       else:
         self._scroll_to(self._home_layout)
       self._prev_joystick_debug_mode = ui_state.joystick_debug_mode
+      self._prev_body_voice_session = ui_state.body_voice_session
 
   def _on_interactive_timeout(self):
     # Don't pop if onboarding
@@ -128,7 +132,7 @@ class MiciMainLayout(Scroller):
 
     if ui_state.started:
       # On body without joystick, stay on home screen
-      if self._is_body and not ui_state.joystick_debug_mode:
+      if self._is_body and not ui_state.joystick_debug_mode and not ui_state.body_voice_session:
         return
       # Don't pop if at standstill
       if not ui_state.sm["carState"].standstill:
