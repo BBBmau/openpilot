@@ -10,9 +10,10 @@ Manager starts this when comma body is active with **ignition** or full onroad �
 Params: ``BodyRandomWalkHumanRender`` (default on) = pygame window; off = headless
 (``SDL_VIDEODRIVER=dummy``). Requires ``pip install bodyjim`` on device.
 
-**Manual run + 409:** only one ``/stream`` client. Stop the manager daemon first, e.g.
-``pkill -f body_random_walkd``. Manager will restart it while the ignition gate is true; to test
-manually for longer, start manager with ``BLOCK=bodyrandomwalkd`` (see ``system/manager/manager.py``).
+**Manual run alongside manager:** the manager may also start ``bodyrandomwalkd``. Stop the daemon first, e.g.
+``pkill -f body_random_walkd``, or use ``BLOCK=bodyrandomwalkd`` for a longer manual test
+(see ``system/manager/manager.py``). ``webrtcd`` allows **multiple** ``/stream`` clients; if ``reset`` still fails,
+check logs and that ``webrtcd`` is running.
 
 After ``reset()``, video can arrive before the WebRTC data channel used for ``testJoystick``; we poll
 ``step`` until ``send`` works so you do not hit ``Session not started``.
@@ -20,7 +21,7 @@ After ``reset()``, video can arrive before the WebRTC data channel used for ``te
 **Diagnosing ``connect/reset failed``** (logs name the stage):
 
 1. **BodyEnv.__init__** — HTTP ``GET http://127.0.0.1:5001/schema?...`` (bodyjim fetches observation schema before WebRTC). If this fails: ``webrtcd`` not running, wrong port, or firewall.
-2. **BodyEnv.reset** — POST ``/stream`` for WebRTC. **HTTP 409 Conflict** means ``webrtcd`` already has an active stream (single client only): **manager** ``bodyrandomwalkd``, **Connect** / browser teleop, **openai_realtime_webrtc**, etc. Stop the other client or **restart webrtcd**.
+2. **BodyEnv.reset** — POST ``/stream`` for WebRTC. Other HTTP errors usually mean bad SDP/codec, ``webrtcd`` down, or a proxy/firewall issue; **restart webrtcd** if the server is wedged.
 3. **webrtc_datachannel_prime** — data channel never opened (timeout). Mismatching **teleoprtc** / ``webrtcd``.
 
 On device: ``curl -sS 'http://127.0.0.1:5001/schema?services=' | head`` and confirm **manager** shows ``webrtcd`` green.
@@ -44,19 +45,11 @@ _VERBOSE = os.environ.get("BODY_RANDOM_WALK_VERBOSE", "").strip().lower() in ("1
 
 
 def _log_connect_failure(stage: str, err: BaseException) -> None:
-  hint = ""
-  if getattr(err, "status", None) == 409:
-    hint = (
-      " — webrtcd allows only one active /stream client (see system/webrtc/webrtcd.py). "
-      "Stop manager bodyrandomwalkd (pkill), disconnect Connect/teleop, stop openai_realtime_webrtc, "
-      "or restart webrtcd."
-    )
   cloudlog.warning(
-    "body_random_walkd: %s failed: %s: %s%s",
+    "body_random_walkd: %s failed: %s: %s",
     stage,
     type(err).__name__,
     err,
-    hint,
   )
   if _VERBOSE:
     cloudlog.exception("body_random_walkd: %s traceback", stage)

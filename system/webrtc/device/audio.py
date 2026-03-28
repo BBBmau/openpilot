@@ -164,6 +164,8 @@ class BodySpeaker:
     self._pm.send('soundRequest', msg)
 
   def start_track(self, track):
+    if self._task is not None and not self._task.done():
+      self._task.cancel()
     self._task = asyncio.ensure_future(self._consume_track(track))
 
   async def _consume_track(self, track):

@@ -131,7 +131,7 @@ class StreamSession:
   shared_pub_master = DynamicPubMaster([])
 
   def __init__(self, sdp: str, cameras: list[str], incoming_services: list[str], outgoing_services: list[str],
-               audio_output=None, debug_mode: bool = False):
+               audio_output=None, debug_mode: bool = False, app: dict | None = None):
     from aiortc.mediastreams import AudioStreamTrack, VideoStreamTrack
     from openpilot.system.webrtc.device.audio import BodyMicAudioTrack, BodySpeaker
     from openpilot.system.webrtc.device.video import LiveStreamVideoStreamTrack
@@ -184,6 +184,7 @@ class StreamSession:
 
     self.run_task: asyncio.Task | None = None
     self.cleaned_up = False
+    self._app = app
     self.logger.info(
       "New stream session (%s), cameras %s, incoming services %s, outgoing services %s, send audio %s, receive audio %s",
       self.identifier, cameras, incoming_services, outgoing_services, config.expected_audio_track, config.incoming_audio_track,
@@ -294,14 +295,30 @@ class StreamSession:
     if self.cleaned_up:
       return
     self.cleaned_up = True
+
+    streams: dict = self._app["streams"] if self._app is not None else {}
+    streams.pop(self.identifier, None)
+
     await self.stream.stop()
     if self.outgoing_bridge is not None:
       self.outgoing_bridge_runner.stop()
     if self.outgoing_audio_track is not None:
       self.outgoing_audio_track.stop()
     if self.audio_output is not None:
-      await self.audio_output.stop()
-    Params().put_bool("JoystickDebugMode", False)
+      shared = (
+        self._app is not None
+        and self.audio_output is self._app.get("body_audio_output")
+      )
+      if shared:
+        if not _get_active_streams(streams):
+          await self.audio_output.stop()
+      else:
+        await self.audio_output.stop()
+    if self._app is not None:
+      if not _get_active_streams(streams):
+        Params().put_bool("JoystickDebugMode", False)
+    else:
+      Params().put_bool("JoystickDebugMode", False)
 
 
 @dataclass
@@ -374,19 +391,12 @@ async def get_stream(request: 'web.Request'):
 
     _cleanup_stale_streams(stream_dict)
 
-    active_streams = _get_active_streams(stream_dict)
-    if active_streams:
-      raise web.HTTPConflict(
-        text=json.dumps({"error": "already_connected", "message": "Another device is already connected to the stream"}),
-        content_type="application/json",
-      )
-
     raw_body = await request.json()
     body = StreamRequestBody(**raw_body)
     _validate_sdp_video_codecs(body.sdp)
 
     session = StreamSession(body.sdp, body.cameras, body.bridge_services_in, body.bridge_services_out,
-                            request.app['body_audio_output'], debug_mode)
+                            request.app['body_audio_output'], debug_mode, request.app)
     answer = await session.get_answer()
     session.start()
     Params().put_bool("JoystickDebugMode", True)
