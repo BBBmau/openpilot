@@ -76,11 +76,19 @@ def comma_body_stack_should_run(started: bool, params: Params, CP: car.CarParams
   """Comma body: WebRTC/bridge/random-walk need the same gate as ignition without full onroad.
 
   ``deviceState.started`` is false in many \"key on\" cases; ``LiveIgnition`` (panda) matches user
-  expectation so ``webrtcd`` and ``bodyrandomwalkd`` share this gate.
+  expectation so ``webrtcd`` / ``bridge`` use this gate; ``bodyrandomwalkd`` also requires
+  ``BodyRandomWalkEnabled`` (see ``body_random_walk_should_run``).
   """
   if not CP.notCar:
     return False
   return started or params.get_bool("LiveIgnition")
+
+
+def body_random_walk_should_run(started: bool, params: Params, CP: car.CarParams) -> bool:
+  if not params.get_bool("BodyRandomWalkEnabled"):
+    return False
+  return comma_body_stack_should_run(started, params, CP)
+
 
 def only_offroad(started: bool, params: Params, CP: car.CarParams) -> bool:
   return not started
@@ -142,7 +150,7 @@ procs = [
   # debug procs
   NativeProcess("bridge", "cereal/messaging", ["./bridge"], comma_body_stack_should_run),
   PythonProcess("webrtcd", "system.webrtc.webrtcd", comma_body_stack_should_run),
-  PythonProcess("bodyrandomwalkd", "tools.body.body_random_walkd", comma_body_stack_should_run),
+  PythonProcess("bodyrandomwalkd", "tools.body.body_random_walkd", body_random_walk_should_run),
   PythonProcess("joystick", "tools.joystick.joystick_control", and_(joystick, iscar)),
 ]
 

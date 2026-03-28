@@ -3,12 +3,15 @@
 Local random walk on the comma device: ``BodyEnv("127.0.0.1", ...)`` → localhost ``webrtcd``
 (same idea as https://github.com/commaai/bodyjim/blob/master/examples/random_walk.py ).
 
-Manager starts this when comma body is active with **ignition** or full onroad — same gate as
-``webrtcd`` / ``bridge``: ``comma_body_stack_should_run`` in ``system/manager/process_config.py``
-(``LiveIgnition`` or ``deviceState.started``, plus ``CP.notCar``).
+Manager starts this when **``BodyRandomWalkEnabled``** (default on) and comma body is active with
+**ignition** or full onroad — see ``body_random_walk_should_run`` in
+``system/manager/process_config.py`` (``LiveIgnition`` or ``deviceState.started``, plus ``CP.notCar``).
+``webrtcd`` / ``bridge`` still use ``comma_body_stack_should_run`` only, so you can disable random
+walk and keep teleop.
 
-Params: ``BodyRandomWalkHumanRender`` (default on) = pygame window; off = headless
-(``SDL_VIDEODRIVER=dummy``). Requires ``pip install bodyjim`` on device.
+Params: ``BodyRandomWalkHumanRender`` (default on) = pygame window when display works; off = headless
+(``SDL_VIDEODRIVER=dummy``). If pygame display init fails, we fall back to headless for this process.
+Requires ``pip install bodyjim`` on device.
 
 **Manual run alongside manager:** the manager may also start ``bodyrandomwalkd``. Stop the daemon first, e.g.
 ``pkill -f body_random_walkd``, or use ``BLOCK=bodyrandomwalkd`` for a longer manual test
@@ -20,8 +23,10 @@ After ``reset()``, video can arrive before the WebRTC data channel used for ``te
 
 **Diagnosing ``connect/reset failed``** (logs name the stage):
 
-1. **BodyEnv.__init__** — HTTP ``GET http://127.0.0.1:5001/schema?...`` (bodyjim fetches observation schema before WebRTC). If this fails: ``webrtcd`` not running, wrong port, or firewall.
-2. **BodyEnv.reset** — POST ``/stream`` for WebRTC. Other HTTP errors usually mean bad SDP/codec, ``webrtcd`` down, or a proxy/firewall issue; **restart webrtcd** if the server is wedged.
+1. **BodyEnv.__init__** — HTTP GET ``schema`` on port 5001 (bodyjim before WebRTC). If this fails:
+   ``webrtcd`` not running, wrong port, or firewall.
+2. **BodyEnv.reset** — POST ``/stream`` for WebRTC. Other HTTP errors: bad SDP/codec, ``webrtcd`` down,
+   or proxy/firewall; **restart webrtcd** if the server is wedged.
 3. **webrtc_datachannel_prime** — data channel never opened (timeout). Mismatching **teleoprtc** / ``webrtcd``.
 
 On device: ``curl -sS 'http://127.0.0.1:5001/schema?services=' | head`` and confirm **manager** shows ``webrtcd`` green.
@@ -39,7 +44,10 @@ from collections.abc import Callable
 import numpy as np
 
 from openpilot.common.params import Params
+from openpilot.common.realtime import Ratekeeper
 from openpilot.common.swaglog import cloudlog
+
+_STEP_HZ = 20
 
 _VERBOSE = os.environ.get("BODY_RANDOM_WALK_VERBOSE", "").strip().lower() in ("1", "true", "yes")
 
@@ -88,15 +96,47 @@ def main() -> None:
   signal.signal(signal.SIGTERM, _stop)
   signal.signal(signal.SIGINT, _stop)
 
+  def should_stop() -> bool:
+    return stop
+
   params = Params()
-  human = params.get_bool("BodyRandomWalkHumanRender")
-  if not human:
+  want_pygame_window = params.get_bool("BodyRandomWalkHumanRender")
+  if not want_pygame_window:
     os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+
+  pygame = None
+  use_human_render = False
+  if want_pygame_window:
+    try:
+      import pygame as _pygame
+
+      pygame = _pygame
+      pygame.init()
+      if not pygame.display.get_init():
+        pygame.display.init()
+      use_human_render = True
+    except ImportError:
+      cloudlog.event("body_random_walkd: pygame missing (required for human render)", error=True)
+      while not stop:
+        time.sleep(5.0)
+      return
+    except pygame.error as e:
+      cloudlog.warning(
+        "body_random_walkd: pygame display failed (%s); headless BodyEnv (set DISPLAY or BodyRandomWalkHumanRender=0)",
+        e,
+      )
+      try:
+        pygame.quit()
+      except Exception:
+        pass
+      pygame = None
+      os.environ["SDL_VIDEODRIVER"] = "dummy"
+      use_human_render = False
 
   BodyEnv = None
   while BodyEnv is None and not stop:
     try:
-      from bodyjim import BodyEnv as _BodyEnv  # noqa: PLC0415
+      from bodyjim import BodyEnv as _BodyEnv
 
       BodyEnv = _BodyEnv
     except ImportError:
@@ -109,19 +149,7 @@ def main() -> None:
   if BodyEnv is None:
     return
 
-  pygame = None
-  if human:
-    try:
-      import pygame as _pygame  # noqa: PLC0415
-
-      pygame = _pygame
-    except ImportError:
-      cloudlog.event("body_random_walkd: pygame missing (required for human render)", error=True)
-      while not stop:
-        time.sleep(5.0)
-      return
-
-  render_mode = "human" if human else None
+  render_mode = "human" if use_human_render else None
   body_ip = "127.0.0.1"
   cameras = ["driver"]
 
@@ -135,7 +163,7 @@ def main() -> None:
           env_try = BodyEnv(body_ip, cameras, [], render_mode=render_mode)
         except Exception as e:
           _log_connect_failure(
-            "BodyEnv.__init__ (GET http://%s:5001/schema — is webrtcd running?)" % body_ip,
+            f"BodyEnv.__init__ (GET http://{body_ip}:5001/schema — is webrtcd running?)",
             e,
           )
           time.sleep(1.0)
@@ -154,7 +182,7 @@ def main() -> None:
           continue
 
         try:
-          if not _prime_webrtc_datachannel(env_try, lambda: stop):
+          if not _prime_webrtc_datachannel(env_try, should_stop):
             try:
               env_try.close()
             except Exception:
@@ -162,19 +190,6 @@ def main() -> None:
             return
         except TimeoutError as e:
           _log_connect_failure("webrtc_datachannel_prime (RTCDataChannel for testJoystick)", e)
-          try:
-            env_try.close()
-          except Exception:
-            pass
-          env_try = None
-          time.sleep(1.0)
-          continue
-
-        try:
-          if human and pygame is not None:
-            pygame.init()
-        except Exception as e:
-          _log_connect_failure("pygame.init", e)
           try:
             env_try.close()
           except Exception:
@@ -198,18 +213,20 @@ def main() -> None:
       break
 
     try:
+      rk = Ratekeeper(_STEP_HZ, print_delay_threshold=None)
       while not stop:
         # bodyjim sets _last_observation in step(); render() asserts it is set (unlike raw Gym examples).
         env.step(env.action_space.sample())
         if stop:
           break
-        if human and pygame is not None:
+        if use_human_render and pygame is not None:
           for event in pygame.event.get():
             if event.type == pygame.QUIT:
               stop = True
               break
           if not stop:
             env.render()
+        rk.keep_time()
     except Exception:
       cloudlog.exception("body_random_walkd: session error; reconnecting")
     finally:
