@@ -1,6 +1,9 @@
 import math
-import numpy as np
+import threading
 import time
+from collections import deque
+
+import numpy as np
 import wave
 
 from cereal import car, messaging
@@ -15,6 +18,8 @@ from openpilot.system.hardware import HARDWARE
 
 SAMPLE_RATE = 48000
 SAMPLE_BUFFER = 4096 # (approx 100ms)
+# Cap queued WebRTC PCM so a stalled consumer does not grow without bound (~0.5s).
+MAX_WEBRTC_QUEUED_SAMPLES = SAMPLE_RATE // 2
 MAX_VOLUME = 1.0
 MIN_VOLUME = 0.1
 SELFDRIVE_STATE_TIMEOUT = 5 # 5 seconds
@@ -72,6 +77,44 @@ class Soundd:
 
     self.spl_filter_weighted = FirstOrderFilter(0, 2.5, FILTER_DT, initialized=False)
 
+    self._webrtc_lock = threading.Lock()
+    self._webrtc_chunks: deque[np.ndarray] = deque()
+    self._webrtc_sr_warned = False
+
+  def _webrtc_queued_samples(self) -> int:
+    return sum(c.shape[0] for c in self._webrtc_chunks)
+
+  def feed_webrtc_pcm(self, pcm_int16: np.ndarray, sample_rate: int) -> None:
+    if pcm_int16.size == 0:
+      return
+    if sample_rate != SAMPLE_RATE:
+      if not self._webrtc_sr_warned:
+        cloudlog.warning("webrtcAudioData sampleRate %s != soundd %s; ignoring webrtc audio", sample_rate, SAMPLE_RATE)
+        self._webrtc_sr_warned = True
+      return
+    fl = pcm_int16.astype(np.float32) / 32768.0
+    with self._webrtc_lock:
+      while self._webrtc_queued_samples() > MAX_WEBRTC_QUEUED_SAMPLES and self._webrtc_chunks:
+        self._webrtc_chunks.popleft()
+      self._webrtc_chunks.append(fl)
+
+  def take_webrtc(self, frames: int) -> np.ndarray:
+    out = np.zeros(frames, dtype=np.float32)
+    taken = 0
+    with self._webrtc_lock:
+      while taken < frames and self._webrtc_chunks:
+        chunk = self._webrtc_chunks[0]
+        need = frames - taken
+        if chunk.shape[0] <= need:
+          out[taken:taken + chunk.shape[0]] = chunk
+          taken += chunk.shape[0]
+          self._webrtc_chunks.popleft()
+        else:
+          out[taken:taken + need] = chunk[:need]
+          self._webrtc_chunks[0] = chunk[need:]
+          taken = frames
+    return out
+
   def load_sounds(self):
     self.loaded_sounds: dict[int, np.ndarray] = {}
 
@@ -112,8 +155,10 @@ class Soundd:
     if status:
       cloudlog.warning(f"soundd stream over/underflow: {status}")
     sound = self.get_sound_data(frames)
-    np.clip(sound, -1.0, 1.0, out=sound)
-    data_out[:frames, 0] = sound
+    webrtc = self.take_webrtc(frames)
+    mixed = sound + webrtc
+    np.clip(mixed, -1.0, 1.0, out=mixed)
+    data_out[:frames, 0] = mixed
 
   def update_alert(self, new_alert):
     current_alert_played_once = self.current_alert == AudibleAlert.none or self.current_sound_frame > len(self.loaded_sounds[self.current_alert])
@@ -152,7 +197,7 @@ class Soundd:
     # sounddevice must be imported after forking processes
     import sounddevice as sd
 
-    sm = messaging.SubMaster(['selfdriveState', 'soundPressure', 'soundRequest'])
+    sm = messaging.SubMaster(['selfdriveState', 'soundPressure', 'soundRequest', 'webrtcAudioData'])
 
     with self.get_stream(sd) as stream:
       rk = Ratekeeper(20)
@@ -160,6 +205,12 @@ class Soundd:
       cloudlog.info(f"soundd stream started: {stream.samplerate=} {stream.channels=} {stream.dtype=} {stream.device=}, {stream.blocksize=}")
       while True:
         sm.update(0)
+
+        if sm.updated['webrtcAudioData']:
+          raw = sm['webrtcAudioData'].data
+          if len(raw) > 0:
+            pcm = np.frombuffer(raw, dtype=np.int16).copy()
+            self.feed_webrtc_pcm(pcm, int(sm['webrtcAudioData'].sampleRate))
 
         if sm.updated['soundPressure'] and self.current_alert == AudibleAlert.none: # only update volume filter when not playing alert
           self.spl_filter_weighted.update(sm["soundPressure"].soundPressureWeightedDb)
