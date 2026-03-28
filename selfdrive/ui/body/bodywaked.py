@@ -2,12 +2,17 @@
 """
 Wake-word listener for comma body: sets BodyVoiceAssistantActive when the phrase is heard.
 
+Requires the ``openwakeword`` Python package on the device. Enable with param ``BodyWakeWordEnabled``
+after installing (see pyproject / ``uv sync`` on dev). If the import fails, bodywaked exits cleanly
+so manager does not spin on ``ModuleNotFoundError``.
+
 For a true "hey comma" detector, train an openWakeWord ONNX model and set param BodyWakeWordModel
 to its absolute path. If unset, a built-in model (hey_jarvis) is used only to validate the pipeline;
 it will not respond to "hey comma".
 """
 from __future__ import annotations
 
+import sys
 import time
 from pathlib import Path
 
@@ -61,12 +66,21 @@ def main():
   config_realtime_process(0, 5)
   cloudlog.bind(daemon="bodywaked")
 
+  try:
+    import openwakeword  # noqa: F401
+  except ImportError:
+    cloudlog.error(
+      "bodywaked: openwakeword is not installed (install deps / uv sync) or keep "
+      "BodyWakeWordEnabled off until then; exiting."
+    )
+    sys.exit(0)
+
   params = Params()
   try:
     model = _load_model(params)
   except Exception:
     cloudlog.exception("bodywaked: failed to load wake models")
-    raise
+    sys.exit(1)
 
   model_names = list(model.models.keys())
   if len(model_names) != 1:

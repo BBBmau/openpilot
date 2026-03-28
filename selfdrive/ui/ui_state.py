@@ -108,6 +108,8 @@ class UIState:
 
   @property
   def is_body(self) -> bool:
+    if self.params.get_bool("CommaBodyUiOverride"):
+      return True
     return self.CP is not None and self.CP.notCar
 
   def update(self) -> None:
