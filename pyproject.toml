@@ -105,6 +105,13 @@ tools = [
   "metadrive-simulator @ git+https://github.com/commaai/metadrive.git@minimal ; (platform_machine != 'aarch64')",
 ]
 
+# Body: comma device → LiveKit (WebRTC) → Pipecat worker → Gemini Live (WebSocket).
+# Install: uv sync --extra gemini_live
+gemini_live = [
+  "pipecat-ai[livekit,google]>=0.0.100,<0.0.200",
+  "python-dotenv>=1.0",
+]
+
 [project.urls]
 Homepage = "https://github.com/commaai/openpilot"
 

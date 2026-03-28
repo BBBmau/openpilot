@@ -12,6 +12,9 @@ OpenAI’s Realtime WebRTC endpoint (``POST https://api.openai.com/v1/realtime/c
 matching the “unified interface” flow from OpenAI’s docs (browser would POST SDP to your
 backend; here the script POSTs SDP directly with your API key).
 
+For **Gemini Live** (WebRTC to LiveKit, worker to Gemini over WebSocket), use
+``gemini_livekit_body_client.py`` plus ``gemini_live_worker/bot.py`` after ``uv sync --extra gemini_live``.
+
 Requires:
   - ``OPENAI_API_KEY``
   - micd publishing ``rawAudioData``
