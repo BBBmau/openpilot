@@ -24,6 +24,11 @@ After ``reset()``, video can arrive before the WebRTC data channel used for ``te
 2. **BodyEnv.reset** — POST ``/stream`` for WebRTC. Other HTTP errors usually mean bad SDP/codec, ``webrtcd`` down, or a proxy/firewall issue; **restart webrtcd** if the server is wedged.
 3. **webrtc_datachannel_prime** — data channel never opened (timeout). Mismatching **teleoprtc** / ``webrtcd``.
 
+If stderr shows ``Error parsing message 'logMonoTime'``, **bodyjim** expects every data-channel JSON
+object to include ``logMonoTime``, ``valid``, and ``data`` (same envelope as bridged cereal).
+Control messages from older ``webrtcd`` (e.g. ``activeCamera``, ``clockSync`` pong) omitted those
+fields and triggered a ``KeyError``. Use a current ``webrtcd`` that sends the full envelope.
+
 On device: ``curl -sS 'http://127.0.0.1:5001/schema?services=' | head`` and confirm **manager** shows ``webrtcd`` green.
 
 Set env **BODY_RANDOM_WALK_VERBOSE=1** for full tracebacks on each failed attempt (noisy).

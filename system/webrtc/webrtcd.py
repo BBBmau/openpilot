@@ -7,6 +7,7 @@ import logging
 import os
 import ssl
 import subprocess
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, TYPE_CHECKING
@@ -209,17 +210,18 @@ class StreamSession:
     return await self.stream.start()
 
   def _handle_clock_sync(self, payload: dict):
-    import time as _time
     data = payload.get("data", {})
     if data.get("action") != "ping":
       return
     pong = json.dumps({
       "type": "clockSync",
+      "logMonoTime": time.monotonic_ns(),
+      "valid": True,
       "data": {
         "action": "pong",
         "browserSendTime": data.get("browserSendTime"),
-        "deviceTime": _time.time() * 1000,  # noqa: TID251
-      }
+        "deviceTime": time.time() * 1000,  # noqa: TID251
+      },
     })
     try:
       if self.stream.has_messaging_channel():
@@ -278,7 +280,16 @@ class StreamSession:
       if self.stream.has_messaging_channel():
         try:
           active = getattr(self.video_track, '_camera_type', 'driver')
-          self.stream.get_messaging_channel().send(json.dumps({"type": "activeCamera", "data": {"camera": active}}))
+          self.stream.get_messaging_channel().send(
+            json.dumps(
+              {
+                "type": "activeCamera",
+                "logMonoTime": time.monotonic_ns(),
+                "valid": True,
+                "data": {"camera": active},
+              }
+            )
+          )
         except Exception:
           pass
       self.logger.info("Stream session (%s) connected", self.identifier)

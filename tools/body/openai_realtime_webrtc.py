@@ -38,8 +38,12 @@ use **far_field** noise shaping and a **higher VAD threshold**; raise ``--vad-th
 ``--semantic-eagerness low``.
 
 **Half-duplex uplink** (on by default): WebRTC uplink and (with ``--micd-suppress-during-assistant``)
-``rawAudioData`` are **fully muted** for the whole assistant ``response`` (from
-``response.create`` / ``response.created`` / ``output_audio_buffer.started`` through ``response.done``).
+``rawAudioData`` are **fully muted** for the whole assistant ``response``. The client arms this gate
+**before** sending ``response.create`` so RTP does not carry real mic audio during API RTT (arming
+only after a successful send caused echo loops on body speakers). Server events
+(``response.created``, ``response.output_item.added`` for assistant messages,
+``output_audio_buffer.started``, etc.) still tighten timing if the model speaks before our arm.
+Mute holds from there through ``response.done`` plus the timing floor / optional soundd drain below.
 After ``response.done``, the client keeps the uplink off until an **API timing floor** (minimum hold
 after ``response.done``, ``response.output_audio_transcript.done``, and ``response.output_audio.done``)
 and, when ``soundd`` publishes ``sounddWebrtcQueueState`` (default on), until **soundd’s WebRTC/body
@@ -297,10 +301,18 @@ class _ResponseHalfDuplexGate:
     return now < self._commit_grace_until
 
   def on_response_created(self) -> None:
+    # Idempotent: client may arm the gate before ``response.create`` is sent; server still emits
+    # ``response.created``. Do not reset transcript/audio clocks on the duplicate event.
+    if self._in_response:
+      return
     self._in_response = True
     self._transcript_done_at = None
     self._audio_done_at = None
     self._reset_post_done_drain()
+
+  def rollback_response_arm(self) -> None:
+    """If ``response.create`` failed after we armed the gate, drop uplink mute."""
+    self._in_response = False
 
   def ensure_response_active(self) -> None:
     """If response.created was missed, still mute from first output audio frame."""
@@ -827,14 +839,20 @@ async def run_session(
     if dc.readyState != "open":
       LOG.warning("data channel not open; skipping response.create")
       return
+    # Arm half-duplex *before* the send so the next RTP uplink frames are silence (and micd suppress
+    # catches up within one poll interval). Arming only after a successful send let real mic audio
+    # leak during RTT and caused echo → committed → response loops on body speakers.
+    if gate is not None:
+      gate.on_response_created()
+    response_busy = True
     try:
       dc.send(json.dumps({"type": "response.create"}))
     except Exception:
       LOG.exception("response.create send failed")
+      response_busy = False
+      if gate is not None:
+        gate.rollback_response_arm()
       return
-    response_busy = True
-    if gate is not None:
-      gate.on_response_created()
 
   def _on_input_committed() -> None:
     nonlocal response_busy, pending_response_create
@@ -934,6 +952,10 @@ async def run_session(
     if gate is not None:
       if typ == "response.created":
         gate.on_response_created()
+      elif typ == "response.output_item.added":
+        item = ev.get("item")
+        if isinstance(item, dict) and item.get("type") == "message" and item.get("role") == "assistant":
+          gate.ensure_response_active()
       elif typ in ("response.output_audio.delta", "output_audio_buffer.started"):
         # WebRTC: model audio is mostly on RTP; ``response.output_audio.delta`` is often absent.
         # ``output_audio_buffer.started`` still fires on the data channel (see Realtime server events).
@@ -1006,7 +1028,7 @@ async def run_session(
       p = Params()
       while not stop.is_set():
         p.put_bool_nonblocking("MicdSuppressRawAudio", gate.suppress_uplink())
-        await asyncio.sleep(0.02)
+        await asyncio.sleep(0.01)
 
     micd_suppress_task = asyncio.create_task(_micd_suppress_loop())
 
