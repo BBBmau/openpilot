@@ -82,6 +82,7 @@ class Soundd:
     self._webrtc_lock = threading.Lock()
     self._webrtc_chunks: deque[np.ndarray] = deque()
     self._webrtc_sr_warned = False
+    self._pm_queue = messaging.PubMaster(["sounddWebrtcQueueState"])
 
   def _webrtc_queued_samples(self) -> int:
     return sum(c.shape[0] for c in self._webrtc_chunks)
@@ -233,6 +234,11 @@ class Soundd:
       while True:
         sm.update(0)
         self._drain_live_pcm(webrtc_pcm_sock, body_pcm_sock)
+
+        q = self._webrtc_queued_samples()
+        msg = messaging.new_message("sounddWebrtcQueueState", valid=True)
+        msg.sounddWebrtcQueueState.queuedSamples = int(min(q, 2**31 - 1))
+        self._pm_queue.send("sounddWebrtcQueueState", msg)
 
         if sm.updated['soundPressure'] and self.current_alert == AudibleAlert.none: # only update volume filter when not playing alert
           self.spl_filter_weighted.update(sm["soundPressure"].soundPressureWeightedDb)

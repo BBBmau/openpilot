@@ -87,6 +87,7 @@ _services: dict[str, tuple] = {
   "soundRequest": (False, 0.),
   "webrtcAudioData": (False, 0.),
   "bodyRealtimeAudioData": (False, 0.),
+  "sounddWebrtcQueueState": (False, 100., 100),
   "roadEncodeData": (False, 20., None, QueueSize.BIG),
   "driverEncodeData": (False, 20., None, QueueSize.BIG),
   "wideRoadEncodeData": (False, 20., None, QueueSize.BIG),

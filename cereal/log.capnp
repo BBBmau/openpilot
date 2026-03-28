@@ -2512,6 +2512,11 @@ struct SoundRequest {
   sound @0 :Car.CarControl.HUDControl.AudibleAlert;
 }
 
+# soundd: mono float32 PCM queued for PortAudio (webrtcAudioData + bodyRealtimeAudioData).
+struct SounddWebrtcQueueState {
+  queuedSamples @0 :Int32;
+}
+
 struct Touch {
   sec @0 :Int64;
   usec @1 :Int64;
@@ -2619,6 +2624,7 @@ struct Event {
     webrtcAudioData @151 :AudioData;
     # Second 48 kHz mono PCM sink for soundd (webrtcd keeps exclusive webrtcAudioData).
     bodyRealtimeAudioData @152 :AudioData;
+    sounddWebrtcQueueState @153 :SounddWebrtcQueueState;
 
     # *********** debug ***********
     testJoystick @52 :Joystick;
