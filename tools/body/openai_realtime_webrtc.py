@@ -65,13 +65,13 @@ cooldown also blocks ``response.create`` briefly after ``response.done``.
 (``speech_started`` / ``speech_stopped`` / ``committed``, etc.). Add ``--input-transcription`` to
 enable ASR on committed user audio and log ``[user speech transcript]`` lines (separate billing).
 
-**Screen + Gemini vision** (``--screen-vision``): registers Realtime function ``describe_visible_screen``.
-When speech triggers a tool call, the client waits for ``response.done``, captures a PNG (macOS:
-``screencapture``; Linux: ``grim -`` if installed, else ``--screenshot-path`` or ``--screenshot-cmd``),
-POSTs the image to the Gemini multimodal API (``GEMINI_API_KEY`` or ``GOOGLE_API_KEY``), sends
-``conversation.item.create`` with ``function_call_output`` (JSON with ``description``), then
-``response.create`` so the model continues in audio—same Realtime session, no browser html2canvas
-required on-device.
+**Body camera + Gemini vision** (``--screen-vision``): registers Realtime function
+``describe_visible_screen``. When speech triggers a tool call, the client waits for
+``response.done``, grabs one decoded frame from the body **livestream** camera (same H.264 feed as
+webrtcd: ``livestreamDriverEncodeData`` / ``livestreamWideRoadEncodeData`` from encoderd), encodes
+PNG, POSTs to the Gemini multimodal API (``GEMINI_API_KEY`` or ``GOOGLE_API_KEY``), sends
+``conversation.item.create`` with ``function_call_output``, then ``response.create`` for the spoken
+reply. Optional ``--screenshot-path`` / ``--screenshot-cmd`` override the camera for desktop testing.
 
 Usage:
   export OPENAI_API_KEY=sk-...
@@ -87,7 +87,6 @@ import base64
 import json
 import logging
 import os
-import platform
 import shlex
 import signal
 import subprocess
@@ -110,6 +109,7 @@ from openpilot.system.webrtc.device.audio import (
   BodySpeaker,
   SPEAKER_SAMPLE_RATE,
 )
+from openpilot.system.webrtc.device.video import grab_livestream_png_bytes
 
 REALTIME_CALLS_URL = "https://api.openai.com/v1/realtime/calls"
 ICE_GATHER_TIMEOUT_S = 30.0
@@ -487,9 +487,9 @@ def _vision_tool_definitions() -> list[dict[str, Any]]:
       "type": "function",
       "name": SCREENSHOT_TOOL_NAME,
       "description": (
-        "Capture the current screen (or configured image source), analyze it with a vision model, "
-        "and return a text description. Call when the user asks what is on screen, to read the "
-        "display or UI, or to identify visible content."
+        "Capture a still from the body livestream camera (road or wide road view), analyze it with "
+        "a vision model, and return a text description. Call when the user asks what you see, what is "
+        "ahead, or to describe the scene."
       ),
       "parameters": {
         "type": "object",
@@ -505,7 +505,13 @@ def _vision_tool_definitions() -> list[dict[str, Any]]:
   ]
 
 
-def _load_screenshot_png(*, path: str | None, cmd: str | None) -> bytes:
+def _load_vision_png(
+  *,
+  path: str | None,
+  cmd: str | None,
+  body_camera: str,
+  camera_timeout_s: float,
+) -> bytes:
   if path:
     with open(path, "rb") as f:
       return f.read()
@@ -514,30 +520,11 @@ def _load_screenshot_png(*, path: str | None, cmd: str | None) -> bytes:
     r = subprocess.run(argv, capture_output=True, timeout=45, check=False)
     if r.returncode != 0:
       err = (r.stderr or b"").decode("utf-8", errors="replace")[:800]
-      raise RuntimeError(f"screenshot command failed (exit {r.returncode}): {err}")
+      raise RuntimeError(f"vision command failed (exit {r.returncode}): {err}")
     if not r.stdout:
-      raise RuntimeError("screenshot command produced no stdout")
+      raise RuntimeError("vision command produced no stdout")
     return r.stdout
-  system = platform.system()
-  if system == "Darwin":
-    r = subprocess.run(
-      ["screencapture", "-x", "-t", "png", "-"],
-      capture_output=True,
-      timeout=45,
-      check=True,
-    )
-    return r.stdout
-  for argv in (["grim", "-"],):
-    try:
-      r = subprocess.run(argv, capture_output=True, timeout=20, check=True)
-    except FileNotFoundError:
-      continue
-    if r.stdout:
-      return r.stdout
-  raise RuntimeError(
-    "No screenshot source: on Linux use grim, or pass --screenshot-path / --screenshot-cmd "
-    "(see script docstring)."
-  )
+  return grab_livestream_png_bytes(body_camera, timeout_s=camera_timeout_s)
 
 
 def _gemini_describe_png(api_key: str, model: str, png_bytes: bytes, instruction: str) -> str:
@@ -612,6 +599,8 @@ async def run_session(
   gemini_model: str,
   screenshot_path: str | None,
   screenshot_cmd: str | None,
+  vision_body_camera: str,
+  vision_camera_timeout_s: float,
 ) -> None:
   loop = asyncio.get_running_loop()
   soundd_watcher: _SounddQueueWatcher | None = None
@@ -670,16 +659,18 @@ async def run_session(
   if screen_vision and gemini_api_key:
     session["tools"] = _vision_tool_definitions()
     vis_hint = (
-      " When the user asks what is on the screen or to read the display, call "
+      " When the user asks what you see, what is ahead, or to describe the scene, call "
       f"{SCREENSHOT_TOOL_NAME}; then summarize the returned description briefly in speech."
     )
     session["instructions"] = (session.get("instructions") or "") + vis_hint
     LOG.info(
-      "screen vision: tool=%s gemini_model=%s screenshot_path=%s screenshot_cmd=%s",
+      "screen vision: tool=%s gemini_model=%s camera=%s timeout=%.1fs path=%s cmd=%s",
       SCREENSHOT_TOOL_NAME,
       gemini_model,
-      screenshot_path or "(default)",
-      screenshot_cmd or "(default)",
+      vision_body_camera,
+      vision_camera_timeout_s,
+      screenshot_path or "(livestream)",
+      screenshot_cmd or "(livestream)",
     )
 
   LOG.info("session: model=%s voice=%s", model, voice)
@@ -794,7 +785,11 @@ async def run_session(
         instruction += f" Emphasize: {focus}."
       try:
         png = await asyncio.to_thread(
-          _load_screenshot_png, path=screenshot_path, cmd=screenshot_cmd
+          _load_vision_png,
+          path=screenshot_path,
+          cmd=screenshot_cmd,
+          body_camera=vision_body_camera,
+          camera_timeout_s=vision_camera_timeout_s,
         )
         assert gemini_api_key is not None
         desc = await asyncio.to_thread(
@@ -1250,7 +1245,20 @@ def main() -> None:
   parser.add_argument(
     "--screen-vision",
     action="store_true",
-    help="Register describe_visible_screen: screenshot → Gemini vision → function_call_output → response.create",
+    help="Register describe_visible_screen: body camera frame → Gemini → function_call_output → response.create",
+  )
+  parser.add_argument(
+    "--vision-camera",
+    choices=("driver", "wideRoad"),
+    default=None,
+    help="Livestream source for vision (default: Params LivestreamCamera, else driver)",
+  )
+  parser.add_argument(
+    "--vision-timeout",
+    type=float,
+    default=15.0,
+    metavar="SEC",
+    help="Max seconds to wait for a decodable livestream frame when using the body camera",
   )
   parser.add_argument(
     "--gemini-model",
@@ -1262,13 +1270,13 @@ def main() -> None:
     "--screenshot-path",
     default=None,
     metavar="PATH",
-    help="Read PNG from this file instead of capturing (useful on headless / body without grim)",
+    help="Read PNG from this file instead of the livestream camera (desktop testing)",
   )
   parser.add_argument(
     "--screenshot-cmd",
     default=None,
     metavar="CMD",
-    help="Shell command that writes PNG bytes to stdout (parsed with shlex)",
+    help="Shell command that writes PNG bytes to stdout; overrides livestream (parsed with shlex)",
   )
   parser.add_argument(
     "--playback-gain",
@@ -1318,6 +1326,9 @@ def main() -> None:
   if args.commit_grace_after_unmute < 0:
     print("--commit-grace-after-unmute must be >= 0", file=sys.stderr)
     sys.exit(1)
+  if args.vision_timeout <= 0:
+    print("--vision-timeout must be > 0", file=sys.stderr)
+    sys.exit(1)
 
   if args.debug:
     log_level = logging.DEBUG
@@ -1343,6 +1354,13 @@ def main() -> None:
     if not gemini_key:
       print("Set GEMINI_API_KEY or GOOGLE_API_KEY for --screen-vision.", file=sys.stderr)
       sys.exit(1)
+
+  vision_cam = args.vision_camera
+  if vision_cam is None:
+    raw_lc = Params().get("LivestreamCamera")
+    if isinstance(raw_lc, bytes):
+      raw_lc = raw_lc.decode("utf-8", errors="replace")
+    vision_cam = raw_lc if raw_lc in ("driver", "wideRoad") else "driver"
 
   try:
     asyncio.run(
@@ -1383,6 +1401,8 @@ def main() -> None:
         gemini_model=args.gemini_model,
         screenshot_path=args.screenshot_path,
         screenshot_cmd=args.screenshot_cmd,
+        vision_body_camera=vision_cam,
+        vision_camera_timeout_s=args.vision_timeout,
       )
     )
   except KeyboardInterrupt:

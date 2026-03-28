@@ -92,3 +92,47 @@ class LiveStreamVideoStreamTrack(TiciVideoStreamTrack):
 
   def codec_preference(self) -> str | None:
     return "H264"
+
+
+def _video_frame_to_png_bytes(frame: av.VideoFrame) -> bytes:
+  rgb = frame.reformat(format="rgb24")
+  enc = av.CodecContext.create("png", "w")
+  chunks: list[bytes] = []
+  for pkt in enc.encode(rgb):
+    chunks.append(bytes(pkt))
+  for pkt in enc.encode(None):
+    chunks.append(bytes(pkt))
+  return b"".join(chunks)
+
+
+def grab_livestream_png_bytes(camera_type: str, *, timeout_s: float = 15.0) -> bytes:
+  """
+  Pull H.264 from ``livestreamDriverEncodeData`` / ``livestreamWideRoadEncodeData`` (encoderd),
+  decode one frame, return PNG bytes — same source as ``LiveStreamVideoStreamTrack`` / webrtcd video.
+  """
+  if camera_type not in LiveStreamVideoStreamTrack.camera_to_sock_mapping:
+    raise ValueError(f"camera_type must be 'driver' or 'wideRoad', not {camera_type!r}")
+  service = LiveStreamVideoStreamTrack.camera_to_sock_mapping[camera_type]
+  sock = messaging.sub_sock(service, conflate=False)
+  codec = av.CodecContext.create("h264", "r")
+  deadline = time.monotonic() + timeout_s
+  last_av_err: av.FFmpegError | None = None
+  while time.monotonic() < deadline:
+    batch = messaging.drain_sock(sock, wait_for_one=True)
+    for msg in batch:
+      evta = getattr(msg, msg.which())
+      raw = bytes(evta.header) + bytes(evta.data)
+      if not raw:
+        continue
+      try:
+        decoded = codec.decode(av.Packet(raw))
+      except av.FFmpegError as e:
+        last_av_err = e
+        continue
+      for frame in decoded:
+        return _video_frame_to_png_bytes(frame)
+  detail = f" (last decode error: {last_av_err})" if last_av_err is not None else ""
+  raise RuntimeError(
+    f"No decodable H.264 frame from {service} within {timeout_s:.1f}s.{detail} "
+    "Is encoderd running and livestream publishing?"
+  )
