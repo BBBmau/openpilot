@@ -150,7 +150,10 @@ class BodySpeaker:
         frame = await track.recv()
         for resampled in resampler.resample(frame):
           msg = messaging.new_message('webrtcAudioData')
-          msg.webrtcAudioData.data = resampled.planes[0].to_bytes()
+          pcm = resampled.to_ndarray()
+          if pcm.ndim > 1:
+            pcm = pcm.reshape(-1)
+          msg.webrtcAudioData.data = np.ascontiguousarray(pcm).tobytes()
           msg.webrtcAudioData.sampleRate = SPEAKER_SAMPLE_RATE
           self._pm.send('webrtcAudioData', msg)
     except MediaStreamError:
