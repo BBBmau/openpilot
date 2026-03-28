@@ -82,6 +82,8 @@ class BodyMicAudioTrack(AudioStreamTrack):
       if sm.updated['rawAudioData']:
         raw_bytes = sm['rawAudioData'].data
         if len(raw_bytes) > 0:
+          if not self._running:
+            break
           # .copy() required: frombuffer is a view over the cereal message buffer, invalidated by next sm.update()
           pcm_int16 = np.frombuffer(raw_bytes, dtype=np.int16).copy()
 
@@ -90,7 +92,12 @@ class BodyMicAudioTrack(AudioStreamTrack):
               self._buffer.push(samples)
             self._buffer_event.set()
 
-          self._loop.call_soon_threadsafe(_push)
+          if self._running:
+            try:
+              self._loop.call_soon_threadsafe(_push)
+            except RuntimeError:
+              # Event loop already closed (process teardown); drop sample.
+              pass
 
   async def recv(self):
     if self.readyState != "live":
@@ -125,6 +132,10 @@ class BodyMicAudioTrack(AudioStreamTrack):
     super().stop()
     self._running = False
     self._buffer_event.set()
+
+  def join_poll_thread(self, timeout: float = 2.0) -> None:
+    if self._thread.is_alive():
+      self._thread.join(timeout=timeout)
 
 
 class BodySpeaker:

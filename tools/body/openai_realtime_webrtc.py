@@ -197,30 +197,6 @@ async def run_session(
   mic: BodyMicAudioTrack = _DebugMicTrack() if debug else BodyMicAudioTrack()
   pc.addTrack(mic)
 
-  LOG.info("creating WebRTC offer and gathering ICE candidates...")
-  offer = await pc.createOffer()
-  await pc.setLocalDescription(offer)
-  await _ice_gathering_complete(pc)
-
-  local = pc.localDescription
-  if local is None or not local.sdp:
-    raise RuntimeError("Missing local SDP after ICE gathering")
-
-  LOG.info("sending SDP to OpenAI realtime/calls ...")
-  answer_sdp = await asyncio.to_thread(_post_realtime_calls, api_key, local.sdp, session)
-  await pc.setRemoteDescription(RTCSessionDescription(sdp=answer_sdp, type="answer"))
-  LOG.info(
-    "setRemoteDescription(answer) done; ICE=%s connection=%s dataChannel=%s",
-    pc.iceConnectionState,
-    pc.connectionState,
-    dc.readyState,
-  )
-
-  print(
-    "\nConnected (WebRTC). Speaking into the comma mic; assistant plays like a webrtcd caller. Ctrl+C to stop.\n",
-    flush=True,
-  )
-
   stop = asyncio.Event()
 
   def request_stop() -> None:
@@ -228,16 +204,55 @@ async def run_session(
 
   loop = asyncio.get_running_loop()
   try:
-    loop.add_signal_handler(signal.SIGINT, request_stop)
-    loop.add_signal_handler(signal.SIGTERM, request_stop)
-  except NotImplementedError:
-    pass
+    try:
+      loop.add_signal_handler(signal.SIGINT, request_stop)
+      loop.add_signal_handler(signal.SIGTERM, request_stop)
+    except NotImplementedError:
+      pass
 
-  await stop.wait()
+    LOG.info("creating WebRTC offer and gathering ICE candidates...")
+    offer = await pc.createOffer()
+    await pc.setLocalDescription(offer)
+    await _ice_gathering_complete(pc)
 
-  mic.stop()
-  await pc.close()
-  await speaker.stop()
+    local = pc.localDescription
+    if local is None or not local.sdp:
+      raise RuntimeError("Missing local SDP after ICE gathering")
+
+    LOG.info("sending SDP to OpenAI realtime/calls ...")
+    answer_sdp = await asyncio.to_thread(_post_realtime_calls, api_key, local.sdp, session)
+    await pc.setRemoteDescription(RTCSessionDescription(sdp=answer_sdp, type="answer"))
+    LOG.info(
+      "setRemoteDescription(answer) done; ICE=%s connection=%s dataChannel=%s",
+      pc.iceConnectionState,
+      pc.connectionState,
+      dc.readyState,
+    )
+
+    print(
+      "\nConnected (WebRTC). Speaking into the comma mic; assistant plays like a webrtcd caller. Ctrl+C to stop.\n",
+      flush=True,
+    )
+
+    await stop.wait()
+  finally:
+    for sig in (signal.SIGINT, signal.SIGTERM):
+      try:
+        loop.remove_signal_handler(sig)
+      except (NotImplementedError, ValueError, OSError):
+        pass
+    # Match webrtcd: stop downlink consumer, tear down PC (stops RTP sender reading mic), then stop cereal thread.
+    try:
+      await speaker.stop()
+    except Exception:
+      LOG.exception("cleanup: speaker.stop")
+    try:
+      await pc.close()
+    except Exception:
+      LOG.exception("cleanup: pc.close")
+    await asyncio.sleep(0.1)
+    mic.stop()
+    mic.join_poll_thread(timeout=2.0)
 
 
 def main() -> None:
