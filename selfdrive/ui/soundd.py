@@ -18,8 +18,10 @@ from openpilot.system.hardware import HARDWARE
 
 SAMPLE_RATE = 48000
 SAMPLE_BUFFER = 4096 # (approx 100ms)
-# Cap queued WebRTC PCM so a stalled consumer does not grow without bound (~0.5s).
-MAX_WEBRTC_QUEUED_SAMPLES = SAMPLE_RATE // 2
+# Cap queued WebRTC/bodyRealtime PCM. Larger queue trades latency for smooth playback: dropping
+# oldest audio (old cap ~0.5s) causes clicks/glitches; a multi-second cap absorbs jitter and brief
+# callback stalls. Still bounded so a dead consumer cannot grow RAM without limit (~30s float32).
+MAX_WEBRTC_QUEUED_SAMPLES = SAMPLE_RATE * 30
 MAX_VOLUME = 1.0
 MIN_VOLUME = 0.1
 SELFDRIVE_STATE_TIMEOUT = 5 # 5 seconds
