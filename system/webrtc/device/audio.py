@@ -15,6 +15,9 @@ AUDIO_PTIME = 0.020
 MIC_SAMPLE_RATE = 16000
 SPEAKER_SAMPLE_RATE = 48000
 
+# Separate msgq publisher from ``webrtcAudioData`` (exclusive to webrtcd) so tools can play PCM without stealing the socket.
+BODY_REALTIME_PCM_SERVICE = "bodyRealtimeAudioData"
+
 AudibleAlert = car.CarControl.HUDControl.AudibleAlert
 BODY_SOUND_ALERTS = {
   "engage": AudibleAlert.engage,
@@ -139,8 +142,9 @@ class BodyMicAudioTrack(AudioStreamTrack):
 
 
 class BodySpeaker:
-  def __init__(self):
-    self._pm = messaging.PubMaster(['soundRequest', 'webrtcAudioData'])
+  def __init__(self, pcm_service: str = "webrtcAudioData"):
+    self._pcm_service = pcm_service
+    self._pm = messaging.PubMaster(["soundRequest", pcm_service])
     self._task: asyncio.Task | None = None
 
   def play_sound(self, sound_name: str):
@@ -156,17 +160,19 @@ class BodySpeaker:
 
     logger = logging.getLogger("webrtcd")
     resampler = AudioResampler(format='s16', layout='mono', rate=SPEAKER_SAMPLE_RATE)
+    svc = self._pcm_service
     try:
       while True:
         frame = await track.recv()
         for resampled in resampler.resample(frame):
-          msg = messaging.new_message('webrtcAudioData')
+          msg = messaging.new_message(svc)
+          ad = getattr(msg, svc)
           pcm = resampled.to_ndarray()
           if pcm.ndim > 1:
             pcm = pcm.reshape(-1)
-          msg.webrtcAudioData.data = np.ascontiguousarray(pcm).tobytes()
-          msg.webrtcAudioData.sampleRate = SPEAKER_SAMPLE_RATE
-          self._pm.send('webrtcAudioData', msg)
+          ad.data = np.ascontiguousarray(pcm).tobytes()
+          ad.sampleRate = SPEAKER_SAMPLE_RATE
+          self._pm.send(svc, msg)
     except MediaStreamError:
       logger.info("Incoming browser audio track ended")
     except asyncio.CancelledError:

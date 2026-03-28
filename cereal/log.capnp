@@ -2617,6 +2617,8 @@ struct Event {
     audioFeedback @149 :AudioFeedback;
     soundRequest @150 :SoundRequest;
     webrtcAudioData @151 :AudioData;
+    # Second 48 kHz mono PCM sink for soundd (webrtcd keeps exclusive webrtcAudioData).
+    bodyRealtimeAudioData @152 :AudioData;
 
     # *********** debug ***********
     testJoystick @52 :Joystick;

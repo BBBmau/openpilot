@@ -36,7 +36,11 @@ from typing import Any
 import requests
 from aiortc import MediaStreamTrack, RTCPeerConnection, RTCSessionDescription
 
-from openpilot.system.webrtc.device.audio import BodyMicAudioTrack, BodySpeaker
+from openpilot.system.webrtc.device.audio import (
+  BODY_REALTIME_PCM_SERVICE,
+  BodyMicAudioTrack,
+  BodySpeaker,
+)
 
 REALTIME_CALLS_URL = "https://api.openai.com/v1/realtime/calls"
 ICE_GATHER_TIMEOUT_S = 30.0
@@ -181,7 +185,7 @@ async def run_session(
   def _on_dc_message(message: str | bytes) -> None:
     on_dc_message(message)
 
-  speaker = BodySpeaker()
+  speaker = BodySpeaker(pcm_service=BODY_REALTIME_PCM_SERVICE)
   audio_to_speaker_started = False
 
   @pc.on("track")

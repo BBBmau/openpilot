@@ -197,7 +197,9 @@ class Soundd:
     # sounddevice must be imported after forking processes
     import sounddevice as sd
 
-    sm = messaging.SubMaster(['selfdriveState', 'soundPressure', 'soundRequest', 'webrtcAudioData'])
+    sm = messaging.SubMaster(
+      ['selfdriveState', 'soundPressure', 'soundRequest', 'webrtcAudioData', 'bodyRealtimeAudioData']
+    )
 
     with self.get_stream(sd) as stream:
       rk = Ratekeeper(20)
@@ -211,6 +213,12 @@ class Soundd:
           if len(raw) > 0:
             pcm = np.frombuffer(raw, dtype=np.int16).copy()
             self.feed_webrtc_pcm(pcm, int(sm['webrtcAudioData'].sampleRate))
+
+        if sm.updated['bodyRealtimeAudioData']:
+          raw = sm['bodyRealtimeAudioData'].data
+          if len(raw) > 0:
+            pcm = np.frombuffer(raw, dtype=np.int16).copy()
+            self.feed_webrtc_pcm(pcm, int(sm['bodyRealtimeAudioData'].sampleRate))
 
         if sm.updated['soundPressure'] and self.current_alert == AudibleAlert.none: # only update volume filter when not playing alert
           self.spl_filter_weighted.update(sm["soundPressure"].soundPressureWeightedDb)
