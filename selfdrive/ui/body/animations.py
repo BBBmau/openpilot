@@ -112,6 +112,9 @@ MOUTH_TALK_2 = [
 ]
 MOUTH_TALK_FRAMES = (MOUTH_TALK_0, MOUTH_TALK_1, MOUTH_TALK_2)
 
+# Eyes + brows for open awake look (no mouth) — overlay while assistant audio plays over blink animations.
+FACE_EYES_OPEN_BROWS = _make_frame(EYE_OPEN, _mirror(EYE_OPEN), BROW_HIGH, _mirror(BROW_HIGH), [])
+
 
 # --- Animations ---
 
