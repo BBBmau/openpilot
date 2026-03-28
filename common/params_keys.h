@@ -42,7 +42,6 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"BodyWakeWordEnabled", {PERSISTENT, BOOL}},
     {"BodyWakeWordModel", {PERSISTENT, STRING}},
     {"BodyWakeWordThreshold", {PERSISTENT, STRING, "0.35"}},
-    {"CommaBodyUiOverride", {PERSISTENT, BOOL}},
     {"ExperimentalMode", {PERSISTENT, BOOL}},
     {"ExperimentalModeConfirmed", {PERSISTENT, BOOL}},
     {"FirmwareQueryDone", {CLEAR_ON_MANAGER_START | CLEAR_ON_ONROAD_TRANSITION, BOOL}},
