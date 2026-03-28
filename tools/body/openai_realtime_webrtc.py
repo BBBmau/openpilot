@@ -36,9 +36,17 @@ use **far_field** noise shaping and a **higher VAD threshold**; raise ``--vad-th
 (up to ~0.95) if it still self-interrupts, or try ``--vad-mode semantic_vad`` with
 ``--semantic-eagerness low``.
 
-**Half-duplex uplink** (on by default): while assistant PCM is playing (and briefly after), the
-script sends **silence** on the WebRTC mic so OpenAI’s VAD does not hear speaker bleed. Use
-``--no-half-duplex`` only with a headset or if you need true full-duplex.
+**Half-duplex uplink** (on by default): the mic is **muted** for the whole assistant
+``response`` (from ``response.created`` through ``response.done``), then unblocked only after
+``response.output_audio_transcript.done`` + ``--half-duplex-after-transcript`` (default **0.5s**)
+and ``response.output_audio.done`` + a short audio tail—so playback and echo tail are covered
+without relying on downlink RMS. Use ``--no-half-duplex`` for true full-duplex (e.g. headset).
+
+**micd** (device ``rawAudioData``): with ``--micd-suppress-during-assistant`` (default on, requires
+half-duplex), the script sets param ``MicdSuppressRawAudio`` in lockstep with that gate so **micd**
+publishes **silence** on ``rawAudioData`` while the assistant is speaking—reducing feedback paths
+beyond WebRTC uplink (e.g. wake word, logging). Use ``--no-micd-suppress-during-assistant`` if you
+need live ``rawAudioData`` during playback.
 
 With ``--server-auto-response`` off (the default), the client sends ``response.create`` only after
 each ``input_audio_buffer.committed`` and **queues** another if a response is still in progress,
@@ -71,6 +79,7 @@ import numpy as np
 import requests
 from aiortc import MediaStreamTrack, RTCPeerConnection, RTCSessionDescription
 
+from openpilot.common.params import Params
 from openpilot.system.webrtc.device.audio import (
   BODY_REALTIME_PCM_SERVICE,
   BodyMicAudioTrack,
@@ -105,29 +114,56 @@ def _format_user_speech_log_line(ev: dict[str, Any]) -> str:
 _soundd_sr_mismatch_logged = False
 
 
-class _DownlinkActivityGate:
-  """Mute uplink while downlink PCM is loud, plus hangover (echo path + DAC tail)."""
+class _ResponseHalfDuplexGate:
+  """Event-driven uplink mute: entire assistant response, then tail after transcript + audio done."""
 
-  def __init__(self, *, rms_threshold: float, hangover_s: float, after_response_s: float) -> None:
-    self._thr = rms_threshold
-    self._hang = hangover_s
-    self._after_resp = after_response_s
+  def __init__(self, *, after_transcript_s: float, after_audio_s: float) -> None:
+    self._after_transcript_s = after_transcript_s
+    self._after_audio_s = after_audio_s
+    self._in_response = False
+    self._transcript_done_at: float | None = None
+    self._audio_done_at: float | None = None
     self._suppress_until = 0.0
 
-  def feed_pcm_int16(self, pcm: np.ndarray) -> None:
-    if pcm.size == 0:
-      return
-    rms = float(np.sqrt(np.mean(pcm.astype(np.float64) ** 2)))
-    if rms >= self._thr:
-      now = time.monotonic()
-      self._suppress_until = max(self._suppress_until, now + self._hang)
-
   def suppress_uplink(self) -> bool:
-    return time.monotonic() < self._suppress_until
-
-  def on_assistant_response_done(self) -> None:
     now = time.monotonic()
-    self._suppress_until = max(self._suppress_until, now + self._after_resp)
+    if self._in_response:
+      return True
+    return now < self._suppress_until
+
+  def on_response_created(self) -> None:
+    self._in_response = True
+    self._transcript_done_at = None
+    self._audio_done_at = None
+
+  def ensure_response_active(self) -> None:
+    """If response.created was missed, still mute from first output audio frame."""
+    if not self._in_response:
+      self.on_response_created()
+
+  def on_output_audio_transcript_done(self) -> None:
+    self._transcript_done_at = time.monotonic()
+
+  def on_output_audio_done(self) -> None:
+    self._audio_done_at = time.monotonic()
+
+  def on_response_done(self) -> None:
+    """Compute earliest safe unmute: max(transcript+hold, audio+tail, now)."""
+    now = time.monotonic()
+    release = now
+    if self._transcript_done_at is not None:
+      release = max(release, self._transcript_done_at + self._after_transcript_s)
+    else:
+      # No assistant transcript event (unusual): still honor post-response hold from response.done.
+      release = max(release, now + self._after_transcript_s)
+    if self._audio_done_at is not None:
+      release = max(release, self._audio_done_at + self._after_audio_s)
+    else:
+      release = max(release, now + self._after_audio_s)
+    self._suppress_until = max(self._suppress_until, release)
+    self._in_response = False
+    self._transcript_done_at = None
+    self._audio_done_at = None
 
 
 class _HalfDuplexMicTrack(BodyMicAudioTrack):
@@ -286,20 +322,21 @@ async def run_session(
   playback_gain: float,
   output_speed: float,
   half_duplex: bool,
-  half_duplex_rms: float,
-  half_duplex_hangover_s: float,
-  half_duplex_after_response_s: float,
+  half_duplex_after_transcript_s: float,
+  half_duplex_after_audio_s: float,
+  micd_suppress_during_assistant: bool,
   log_user_speech: bool,
   input_transcription: bool,
   input_transcription_model: str,
 ) -> None:
-  gate: _DownlinkActivityGate | None = None
+  gate: _ResponseHalfDuplexGate | None = None
   if half_duplex:
-    gate = _DownlinkActivityGate(
-      rms_threshold=half_duplex_rms,
-      hangover_s=half_duplex_hangover_s,
-      after_response_s=half_duplex_after_response_s,
+    gate = _ResponseHalfDuplexGate(
+      after_transcript_s=half_duplex_after_transcript_s,
+      after_audio_s=half_duplex_after_audio_s,
     )
+
+  Params().put_bool_nonblocking("MicdSuppressRawAudio", False)
 
   audio_input: dict[str, Any] = {
     "turn_detection": _turn_detection_payload(
@@ -337,11 +374,15 @@ async def run_session(
   LOG.info("session: model=%s voice=%s", model, voice)
   if gate is not None:
     LOG.info(
-      "half-duplex uplink: mute while downlink RMS≥%.0f (hangover %.2fs, +%.2fs after response.done)",
-      half_duplex_rms,
-      half_duplex_hangover_s,
-      half_duplex_after_response_s,
+      "half-duplex uplink: mute for each response.created→done; unmute after max("
+      "transcript.done+%.2fs, output_audio.done+%.2fs)",
+      half_duplex_after_transcript_s,
+      half_duplex_after_audio_s,
     )
+    if micd_suppress_during_assistant:
+      LOG.info("micd: MicdSuppressRawAudio follows half-duplex (rawAudioData silence while gated)")
+  elif micd_suppress_during_assistant:
+    LOG.warning("--micd-suppress-during-assistant ignored without half-duplex")
   if input_transcription:
     LOG.info("input transcription enabled (model=%s)", input_transcription_model)
     print(
@@ -441,9 +482,18 @@ async def run_session(
       _on_input_committed()
     elif typ == "response.done":
       if gate is not None:
-        gate.on_assistant_response_done()
+        gate.on_response_done()
       if not server_auto_response:
         _on_response_done()
+    if gate is not None:
+      if typ == "response.created":
+        gate.on_response_created()
+      elif typ == "response.output_audio.delta":
+        gate.ensure_response_active()
+      elif typ == "response.output_audio_transcript.done":
+        gate.on_output_audio_transcript_done()
+      elif typ == "response.output_audio.done":
+        gate.on_output_audio_done()
     if typ in ("response.output_audio_transcript.delta", "response.output_text.delta"):
       d = ev.get("delta", "")
       if d:
@@ -483,7 +533,6 @@ async def run_session(
     pcm_service=BODY_REALTIME_PCM_SERVICE,
     pcm_gain=playback_gain,
     on_publish_sample_rate=_soundd_body_realtime_sample_rate_check,
-    on_downlink_pcm=gate.feed_pcm_int16 if gate is not None else None,
   )
   audio_to_speaker_started = False
 
@@ -500,6 +549,16 @@ async def run_session(
   pc.addTrack(mic)
 
   stop = asyncio.Event()
+  micd_suppress_task: asyncio.Task[None] | None = None
+  if micd_suppress_during_assistant and gate is not None:
+
+    async def _micd_suppress_loop() -> None:
+      p = Params()
+      while not stop.is_set():
+        p.put_bool_nonblocking("MicdSuppressRawAudio", gate.suppress_uplink())
+        await asyncio.sleep(0.02)
+
+    micd_suppress_task = asyncio.create_task(_micd_suppress_loop())
 
   def request_stop() -> None:
     stop.set()
@@ -538,6 +597,13 @@ async def run_session(
 
     await stop.wait()
   finally:
+    if micd_suppress_task is not None:
+      micd_suppress_task.cancel()
+      try:
+        await micd_suppress_task
+      except asyncio.CancelledError:
+        pass
+    Params().put_bool_nonblocking("MicdSuppressRawAudio", False)
     for sig in (signal.SIGINT, signal.SIGTERM):
       try:
         loop.remove_signal_handler(sig)
@@ -629,28 +695,27 @@ def main() -> None:
     "--half-duplex/--no-half-duplex",
     dest="half_duplex",
     default=True,
-    help="Mute WebRTC uplink while assistant audio is playing (default on; stops echo from triggering VAD)",
+    help="Mute WebRTC uplink for each assistant response (response.created→done) plus tail timing below",
   )
   parser.add_argument(
-    "--half-duplex-rms",
-    type=float,
-    default=380.0,
-    metavar="INT16_RMS",
-    help="Downlink RMS threshold to extend uplink mute (default 380; lower=more aggressive mute)",
-  )
-  parser.add_argument(
-    "--half-duplex-hangover",
+    "--half-duplex-after-transcript",
     type=float,
     default=0.5,
     metavar="SEC",
-    help="Keep uplink muted this long after each loud downlink chunk (default 0.5)",
+    help="Keep uplink muted at least this long after response.output_audio_transcript.done (default 0.5)",
   )
   parser.add_argument(
-    "--half-duplex-after-response",
+    "--half-duplex-after-audio",
     type=float,
-    default=0.45,
+    default=0.05,
     metavar="SEC",
-    help="Extra uplink mute after response.done for speaker/DAC tail (default 0.45)",
+    help="Keep uplink muted at least this long after response.output_audio.done (DAC/speaker tail; default 0.05)",
+  )
+  parser.add_argument(
+    "--micd-suppress-during-assistant/--no-micd-suppress-during-assistant",
+    dest="micd_suppress_during_assistant",
+    default=True,
+    help="With half-duplex, set MicdSuppressRawAudio so micd publishes silence on rawAudioData while gated (default on)",
   )
   parser.add_argument(
     "--log-user-speech/--no-log-user-speech",
@@ -692,11 +757,8 @@ def main() -> None:
   if not 0.0 <= args.vad_threshold <= 1.0:
     print("--vad-threshold must be between 0 and 1", file=sys.stderr)
     sys.exit(1)
-  if args.half_duplex_rms < 0:
-    print("--half-duplex-rms must be >= 0", file=sys.stderr)
-    sys.exit(1)
-  if args.half_duplex_hangover < 0 or args.half_duplex_after_response < 0:
-    print("--half-duplex-hangover and --half-duplex-after-response must be >= 0", file=sys.stderr)
+  if args.half_duplex_after_transcript < 0 or args.half_duplex_after_audio < 0:
+    print("--half-duplex-after-transcript and --half-duplex-after-audio must be >= 0", file=sys.stderr)
     sys.exit(1)
 
   if args.debug:
@@ -735,9 +797,9 @@ def main() -> None:
         playback_gain=args.playback_gain,
         output_speed=args.output_speed,
         half_duplex=args.half_duplex,
-        half_duplex_rms=args.half_duplex_rms,
-        half_duplex_hangover_s=args.half_duplex_hangover,
-        half_duplex_after_response_s=args.half_duplex_after_response,
+        half_duplex_after_transcript_s=args.half_duplex_after_transcript,
+        half_duplex_after_audio_s=args.half_duplex_after_audio,
+        micd_suppress_during_assistant=args.micd_suppress_during_assistant,
         log_user_speech=args.log_user_speech,
         input_transcription=args.input_transcription,
         input_transcription_model=args.input_transcription_model,

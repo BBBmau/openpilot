@@ -4,6 +4,7 @@ from functools import cache
 import threading
 
 from cereal import messaging
+from openpilot.common.params import Params
 from openpilot.common.realtime import Ratekeeper
 from openpilot.common.utils import retry
 from openpilot.common.swaglog import cloudlog
@@ -46,6 +47,7 @@ class Mic:
   def __init__(self):
     self.rk = Ratekeeper(RATE)
     self.pm = messaging.PubMaster(['soundPressure', 'rawAudioData'])
+    self.params = Params()
 
     self.measurements = np.empty(0)
 
@@ -78,6 +80,8 @@ class Mic:
     """
     msg = messaging.new_message('rawAudioData', valid=True)
     audio_data_int_16 = (indata[:, 0] * 32767).astype(np.int16)
+    if self.params.get_bool("MicdSuppressRawAudio"):
+      audio_data_int_16 = np.zeros_like(audio_data_int_16)
     msg.rawAudioData.data = audio_data_int_16.tobytes()
     msg.rawAudioData.sampleRate = SAMPLE_RATE
     self.pm.send('rawAudioData', msg)
