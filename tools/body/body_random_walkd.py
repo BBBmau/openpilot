@@ -4,6 +4,7 @@ On-device Gymnasium-style random walk for comma body using bodyjim → localhost
 
 Runs for a notCar platform while manager sees panda **ignition** or full **onroad**
 (``deviceState.started``). Ignition alone is enough even when startup conditions block ``started``.
+Manager starts **webrtcd** and **bridge** under the same rule so ``BodyEnv(127.0.0.1)`` can connect.
 
 Requires the ``bodyjim`` package on the device::
 

@@ -160,7 +160,8 @@ class UIState:
     self.always_on_dm = self.params.get_bool("AlwaysOnDM")
 
     # Peak-ish envelope from chunks published to soundd (both webrtcd and OpenAI tool paths).
-    self.assistant_downlink_rms *= 0.9
+    chunk_peak = 0.0
+    pcm_updated = False
     for svc in ("bodyRealtimeAudioData", "webrtcAudioData"):
       if self.sm.updated[svc]:
         raw = self.sm[svc].data
@@ -169,9 +170,13 @@ class UIState:
         pcm = np.frombuffer(raw, dtype=np.int16).copy()
         if pcm.size == 0:
           continue
+        pcm_updated = True
         chunk_rms = float(np.sqrt(np.mean(pcm.astype(np.float64) ** 2)) / 32768.0)
-        boosted = min(1.0, chunk_rms * 6.0)
-        self.assistant_downlink_rms = max(self.assistant_downlink_rms, boosted)
+        chunk_peak = max(chunk_peak, min(1.0, chunk_rms * 6.0))
+    # Faster decay when no new PCM this frame so the mouth tracks end-of-speech closer to playback.
+    self.assistant_downlink_rms *= 0.92 if pcm_updated else 0.78
+    if pcm_updated:
+      self.assistant_downlink_rms = max(self.assistant_downlink_rms, chunk_peak)
 
   def _update_status(self) -> None:
     if self.started and self.sm.updated["selfdriveState"]:

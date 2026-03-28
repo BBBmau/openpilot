@@ -72,15 +72,21 @@ def bodywaked_should_run(started: bool, params: Params, CP: car.CarParams) -> bo
   return CP.notCar and params.get_bool("BodyWakeWordEnabled")
 
 
-def body_random_walk_should_run(started: bool, params: Params, CP: car.CarParams) -> bool:
-  """Comma body only: random walk when ignition is on or full onroad (deviceState.started).
+def comma_body_stack_should_run(started: bool, params: Params, CP: car.CarParams) -> bool:
+  """Comma body: WebRTC/bridge/random-walk need the same gate as ignition without full onroad.
 
-  ``started`` alone is often false while ignition is on (startup blocked, temp, etc.); ``LiveIgnition``
-  mirrors panda ignition so the daemon matches the usual \"ignition on\" expectation.
+  ``deviceState.started`` is false in many \"key on\" cases; ``LiveIgnition`` (panda) matches user
+  expectation so ``webrtcd`` is up whenever ``bodyrandomwalkd`` would be (except the walk param).
   """
-  if not params.get_bool("BodyRandomWalkEnabled") or not CP.notCar:
+  if not CP.notCar:
     return False
   return started or params.get_bool("LiveIgnition")
+
+
+def body_random_walk_should_run(started: bool, params: Params, CP: car.CarParams) -> bool:
+  if not params.get_bool("BodyRandomWalkEnabled"):
+    return False
+  return comma_body_stack_should_run(started, params, CP)
 
 def only_offroad(started: bool, params: Params, CP: car.CarParams) -> bool:
   return not started
@@ -140,8 +146,8 @@ procs = [
   PythonProcess("feedbackd", "selfdrive.ui.feedback.feedbackd", only_onroad),
 
   # debug procs
-  NativeProcess("bridge", "cereal/messaging", ["./bridge"], notcar),
-  PythonProcess("webrtcd", "system.webrtc.webrtcd", notcar),
+  NativeProcess("bridge", "cereal/messaging", ["./bridge"], comma_body_stack_should_run),
+  PythonProcess("webrtcd", "system.webrtc.webrtcd", comma_body_stack_should_run),
   PythonProcess("bodyrandomwalkd", "tools.body.body_random_walkd", body_random_walk_should_run),
   PythonProcess("joystick", "tools.joystick.joystick_control", and_(joystick, iscar)),
 ]
