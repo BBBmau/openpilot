@@ -118,7 +118,7 @@ async def run_session(
     if track.kind != "audio" or audio_to_speaker_started:
       return
     audio_to_speaker_started = True
-    asyncio.create_task(speaker.start_track(track))
+    speaker.start_track(track)
 
   mic = BodyMicAudioTrack()
   pc.addTrack(mic)
