@@ -18,6 +18,10 @@ Requires:
   - soundd consuming ``bodyRealtimeAudioData`` (no audio if soundd is not running)
   - Network access to api.openai.com
 
+Use ``--playback-gain`` if assistant audio is too quiet (soundd plays this path at fixed level,
+unlike alert chimes). Try ``--voice cedar`` or ``--voice marin`` for higher-quality voices.
+``--output-speed`` slightly below 1.0 can sound clearer on small speakers.
+
 Long reply delay is often **server VAD**: ambient noise keeps the model thinking you are still
 talking until silence is detected. Tune ``--vad-threshold`` (higher → less sensitive) and
 ``--vad-silence-ms`` (lower → faster end-of-turn). Try ``--vad-mode semantic_vad`` in very noisy
@@ -154,12 +158,18 @@ async def run_session(
   vad_silence_ms: int,
   vad_prefix_ms: int,
   semantic_eagerness: str,
+  playback_gain: float,
+  output_speed: float,
 ) -> None:
   session: dict[str, Any] = {
     "type": "realtime",
     "model": model,
     "audio": {
-      "output": {"voice": voice},
+      "output": {
+        "voice": voice,
+        "format": {"type": "audio/pcm", "rate": 24000},
+        "speed": output_speed,
+      },
       "input": {
         "turn_detection": _turn_detection_payload(
           vad_mode=vad_mode,
@@ -230,7 +240,7 @@ async def run_session(
   def _on_dc_message(message: str | bytes) -> None:
     on_dc_message(message)
 
-  speaker = BodySpeaker(pcm_service=BODY_REALTIME_PCM_SERVICE)
+  speaker = BodySpeaker(pcm_service=BODY_REALTIME_PCM_SERVICE, pcm_gain=playback_gain)
   audio_to_speaker_started = False
 
   @pc.on("track")
@@ -356,7 +366,27 @@ def main() -> None:
     default="high",
     help="semantic_vad only: higher chunks sooner (default high for lower latency)",
   )
+  parser.add_argument(
+    "--playback-gain",
+    type=float,
+    default=1.75,
+    metavar="X",
+    help="Digital gain on downlink PCM before soundd (1.0 = as decoded; default 1.75; clip at ±32767)",
+  )
+  parser.add_argument(
+    "--output-speed",
+    type=float,
+    default=1.0,
+    metavar="X",
+    help="Realtime audio.output.speed (0.25–1.5; default 1.0; slightly lower can sound clearer)",
+  )
   args = parser.parse_args()
+  if args.playback_gain <= 0:
+    print("--playback-gain must be > 0", file=sys.stderr)
+    sys.exit(1)
+  if not 0.25 <= args.output_speed <= 1.5:
+    print("--output-speed must be between 0.25 and 1.5", file=sys.stderr)
+    sys.exit(1)
 
   if args.debug:
     log_level = logging.DEBUG
@@ -388,6 +418,8 @@ def main() -> None:
         vad_silence_ms=args.vad_silence_ms,
         vad_prefix_ms=args.vad_prefix_ms,
         semantic_eagerness=args.semantic_eagerness,
+        playback_gain=args.playback_gain,
+        output_speed=args.output_speed,
       )
     )
   except KeyboardInterrupt:

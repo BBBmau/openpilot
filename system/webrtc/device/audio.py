@@ -142,8 +142,9 @@ class BodyMicAudioTrack(AudioStreamTrack):
 
 
 class BodySpeaker:
-  def __init__(self, pcm_service: str = "webrtcAudioData"):
+  def __init__(self, pcm_service: str = "webrtcAudioData", pcm_gain: float = 1.0):
     self._pcm_service = pcm_service
+    self._pcm_gain = float(pcm_gain)
     self._pm = messaging.PubMaster(["soundRequest", pcm_service])
     self._task: asyncio.Task | None = None
 
@@ -169,7 +170,15 @@ class BodySpeaker:
           ad = getattr(msg, svc)
           pcm = resampled.to_ndarray()
           if pcm.ndim > 1:
-            pcm = pcm.reshape(-1)
+            # Planar stereo from the decoder/resampler: average to mono (reshape would interleave wrongly).
+            if pcm.shape[0] == 2:
+              pcm = pcm.mean(axis=0).astype(np.int16)
+            else:
+              pcm = pcm.reshape(-1)
+          if self._pcm_gain != 1.0:
+            v = pcm.astype(np.float32) * self._pcm_gain
+            np.clip(v, -32768, 32767, out=v)
+            pcm = v.astype(np.int16)
           ad.data = np.ascontiguousarray(pcm).tobytes()
           ad.sampleRate = SPEAKER_SAMPLE_RATE
           self._pm.send(svc, msg)
