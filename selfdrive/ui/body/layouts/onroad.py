@@ -10,7 +10,14 @@ from openpilot.system.ui.widgets import Widget
 from openpilot.system.ui.widgets.button import Button, ButtonStyle
 from openpilot.selfdrive.ui.body.widgets.pairing_dialog import BodyPairingScreen
 from openpilot.selfdrive.ui.ui_state import ui_state
-from openpilot.selfdrive.ui.body.animations import FaceAnimator, ASLEEP, INQUISITIVE, NORMAL, SLEEPY
+from openpilot.selfdrive.ui.body.animations import (
+  FaceAnimator,
+  ASLEEP,
+  INQUISITIVE,
+  MOUTH_TALK_FRAMES,
+  NORMAL,
+  SLEEPY,
+)
 from opendbc.car.body.values import CAR
 
 GRID_COLS = 16
@@ -23,6 +30,20 @@ IDLE_SPEED_THRESH = 0.01   # m/s — below this counts as no input
 
 PAIR_BTN_FONT_SIZE = 60
 PAIR_BTN_MARGIN = 20
+
+# Strip default mouth dots so we can substitute talking shapes (matches MOUTH_* grid rows/cols).
+_MOUTH_ROW_LO = 6
+_MOUTH_ROW_HI = 7
+_MOUTH_COL_LO = 5
+_MOUTH_COL_HI = 10
+
+
+def _strip_mouth_region(dots: list[tuple[int, int]]) -> list[tuple[int, int]]:
+  return [
+    d
+    for d in dots
+    if not (_MOUTH_ROW_LO <= d[0] <= _MOUTH_ROW_HI and _MOUTH_COL_LO <= d[1] <= _MOUTH_COL_HI)
+  ]
 
 
 class BodyLayout(Widget):
@@ -123,6 +144,9 @@ class BodyLayout(Widget):
 
   def _render(self, rect: rl.Rectangle):
     dots = self._animator.get_dots()
+    if ui_state.body_assistant_speaking:
+      phase = int(time.monotonic() * 10.0) % len(MOUTH_TALK_FRAMES)
+      dots = _strip_mouth_region(dots) + list(MOUTH_TALK_FRAMES[phase])
     animation = self._animator._animation
     if self._turning_left and animation.left_turn_remove:
       remove_set = set(animation.left_turn_remove)

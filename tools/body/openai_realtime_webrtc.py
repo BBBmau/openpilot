@@ -3,7 +3,9 @@
 OpenAI Realtime API over WebRTC using the same device audio path as webrtcd:
 
   - Uplink:  ``BodyMicAudioTrack`` → ``rawAudioData`` (micd must be running)
-  - Downlink: remote audio track → ``BodySpeaker`` → ``webrtcAudioData`` (soundd path)
+  - Downlink: remote audio track → ``BodySpeaker`` → ``bodyRealtimeAudioData`` (``soundd`` must be
+    running — on comma body, manager starts ``soundd`` offroad via ``soundd_should_run``; otherwise
+    use onroad or enable driver view / ``IsDriverViewEnabled``)
 
 This does **not** change the webrtcd HTTP server; it is a separate client that talks to
 OpenAI’s Realtime WebRTC endpoint (``POST https://api.openai.com/v1/realtime/calls``),
@@ -13,7 +15,13 @@ backend; here the script POSTs SDP directly with your API key).
 Requires:
   - ``OPENAI_API_KEY``
   - micd publishing ``rawAudioData``
+  - soundd consuming ``bodyRealtimeAudioData`` (no audio if soundd is not running)
   - Network access to api.openai.com
+
+Long reply delay is often **server VAD**: ambient noise keeps the model thinking you are still
+talking until silence is detected. Tune ``--vad-threshold`` (higher → less sensitive) and
+``--vad-silence-ms`` (lower → faster end-of-turn). Try ``--vad-mode semantic_vad`` in very noisy
+environments.
 
 Usage:
   export OPENAI_API_KEY=sk-...
@@ -112,6 +120,27 @@ def _post_realtime_calls(api_key: str, offer_sdp: str, session: dict[str, Any]) 
   return r.text
 
 
+def _turn_detection_payload(
+  *,
+  vad_mode: str,
+  vad_threshold: float,
+  vad_silence_ms: int,
+  vad_prefix_ms: int,
+  semantic_eagerness: str,
+) -> dict[str, Any]:
+  base_conv = {"create_response": True, "interrupt_response": True}
+  if vad_mode == "semantic_vad":
+    return {"type": "semantic_vad", "eagerness": semantic_eagerness, **base_conv}
+  thr = max(0.0, min(1.0, float(vad_threshold)))
+  return {
+    "type": "server_vad",
+    "threshold": thr,
+    "prefix_padding_ms": vad_prefix_ms,
+    "silence_duration_ms": vad_silence_ms,
+    **base_conv,
+  }
+
+
 async def run_session(
   *,
   api_key: str,
@@ -120,11 +149,23 @@ async def run_session(
   instructions: str | None,
   verbose: bool,
   debug: bool,
+  vad_mode: str,
+  vad_threshold: float,
+  vad_silence_ms: int,
+  vad_prefix_ms: int,
+  semantic_eagerness: str,
 ) -> None:
   session: dict[str, Any] = {
     "type": "realtime",
     "model": model,
     "audio": {"output": {"voice": voice}},
+    "turn_detection": _turn_detection_payload(
+      vad_mode=vad_mode,
+      vad_threshold=vad_threshold,
+      vad_silence_ms=vad_silence_ms,
+      vad_prefix_ms=vad_prefix_ms,
+      semantic_eagerness=semantic_eagerness,
+    ),
   }
   if instructions:
     session["instructions"] = instructions
@@ -278,6 +319,39 @@ def main() -> None:
     action="store_true",
     help="Log everything from --verbose plus ICE details, session JSON, mic uplink frames, and aiortc INFO",
   )
+  parser.add_argument(
+    "--vad-mode",
+    choices=("server_vad", "semantic_vad"),
+    default="server_vad",
+    help="Realtime turn detection: server_vad uses silence (tune threshold/silence); semantic_vad uses utterance semantics",
+  )
+  parser.add_argument(
+    "--vad-threshold",
+    type=float,
+    default=0.65,
+    metavar="0-1",
+    help="server_vad only: higher = louder required to count as speech (better in noisy rooms; default 0.65)",
+  )
+  parser.add_argument(
+    "--vad-silence-ms",
+    type=int,
+    default=400,
+    metavar="MS",
+    help="server_vad only: silence length to end a turn; lower = faster replies (default 400)",
+  )
+  parser.add_argument(
+    "--vad-prefix-ms",
+    type=int,
+    default=300,
+    metavar="MS",
+    help="server_vad only: audio kept before detected speech start (default 300)",
+  )
+  parser.add_argument(
+    "--semantic-eagerness",
+    choices=("low", "medium", "high", "auto"),
+    default="high",
+    help="semantic_vad only: higher chunks sooner (default high for lower latency)",
+  )
   args = parser.parse_args()
 
   if args.debug:
@@ -305,6 +379,11 @@ def main() -> None:
         instructions=args.instructions,
         verbose=args.verbose or args.debug,
         debug=args.debug,
+        vad_mode=args.vad_mode,
+        vad_threshold=args.vad_threshold,
+        vad_silence_ms=args.vad_silence_ms,
+        vad_prefix_ms=args.vad_prefix_ms,
+        semantic_eagerness=args.semantic_eagerness,
       )
     )
   except KeyboardInterrupt:

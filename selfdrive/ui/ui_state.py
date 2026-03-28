@@ -56,6 +56,8 @@ class UIState:
         "liveParameters",
         "testJoystick",
         "rawAudioData",
+        "webrtcAudioData",
+        "bodyRealtimeAudioData",
       ]
     )
 
@@ -83,6 +85,8 @@ class UIState:
     self.CP: car.CarParams | None = None
     self.light_sensor: float = -1.0
     self._param_update_time: float = 0.0
+    # Envelope of downlink assistant PCM (webrtc / OpenAI realtime → soundd) for body talking animation.
+    self.assistant_downlink_rms: float = 0.0
 
     # Callbacks
     self._offroad_transition_callbacks: list[Callable[[], None]] = []
@@ -109,6 +113,10 @@ class UIState:
   @property
   def is_body(self) -> bool:
     return self.CP is not None and self.CP.notCar
+
+  @property
+  def body_assistant_speaking(self) -> bool:
+    return self.assistant_downlink_rms > 0.02
 
   def update(self) -> None:
     self.prime_state.start()  # start thread after manager forks ui
@@ -150,6 +158,20 @@ class UIState:
 
     self.is_metric = self.params.get_bool("IsMetric")
     self.always_on_dm = self.params.get_bool("AlwaysOnDM")
+
+    # Peak-ish envelope from chunks published to soundd (both webrtcd and OpenAI tool paths).
+    self.assistant_downlink_rms *= 0.9
+    for svc in ("bodyRealtimeAudioData", "webrtcAudioData"):
+      if self.sm.updated[svc]:
+        raw = self.sm[svc].data
+        if len(raw) < 4:
+          continue
+        pcm = np.frombuffer(raw, dtype=np.int16).copy()
+        if pcm.size == 0:
+          continue
+        chunk_rms = float(np.sqrt(np.mean(pcm.astype(np.float64) ** 2)) / 32768.0)
+        boosted = min(1.0, chunk_rms * 6.0)
+        self.assistant_downlink_rms = max(self.assistant_downlink_rms, boosted)
 
   def _update_status(self) -> None:
     if self.started and self.sm.updated["selfdriveState"]:

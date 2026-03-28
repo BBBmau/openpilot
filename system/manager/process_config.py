@@ -4,7 +4,7 @@ import platform
 
 from cereal import car
 from openpilot.common.params import Params
-from openpilot.system.hardware import PC, TICI
+from openpilot.system.hardware import HARDWARE, PC, TICI
 from openpilot.system.manager.process import PythonProcess, NativeProcess, DaemonProcess
 
 WEBCAM = os.getenv("USE_WEBCAM") is not None
@@ -57,6 +57,17 @@ def micd_onroad_or_body(started: bool, params: Params, CP: car.CarParams) -> boo
   return started or CP.notCar
 
 
+def soundd_should_run(started: bool, params: Params, CP: car.CarParams) -> bool:
+  """Like driverview for bench/cars, plus body offroad so webrtcAudioData/bodyRealtimeAudioData reach speakers."""
+  if driverview(started, params, CP):
+    return True
+  if CP.notCar:
+    return True
+  if not PC and HARDWARE.get_device_type() == "tizi":
+    return True
+  return False
+
+
 def bodywaked_should_run(started: bool, params: Params, CP: car.CarParams) -> bool:
   return CP.notCar and params.get_bool("BodyWakeWordEnabled")
 
@@ -90,7 +101,7 @@ procs = [
 
   PythonProcess("sensord", "system.sensord.sensord", only_onroad, enabled=not PC),
   PythonProcess("ui", "selfdrive.ui.ui", always_run, restart_if_crash=True),
-  PythonProcess("soundd", "selfdrive.ui.soundd", driverview),
+  PythonProcess("soundd", "selfdrive.ui.soundd", soundd_should_run),
   PythonProcess("locationd", "selfdrive.locationd.locationd", only_onroad),
   NativeProcess("_pandad", "selfdrive/pandad", ["./pandad"], always_run, enabled=False),
   PythonProcess("calibrationd", "selfdrive.locationd.calibrationd", only_onroad),

@@ -100,6 +100,18 @@ MOUTH_SAD = [
 (7, 6),                 (7, 9)
 ]
 
+# Simple lip-sync shapes (same grid as other mouths; cycle while assistant audio plays).
+MOUTH_TALK_0 = [(7, 7), (7, 8)]
+MOUTH_TALK_1 = [
+  (6, 7), (6, 8),
+  (7, 6), (7, 7), (7, 8), (7, 9),
+]
+MOUTH_TALK_2 = [
+  (6, 6), (6, 7), (6, 8), (6, 9),
+  (7, 7), (7, 8),
+]
+MOUTH_TALK_FRAMES = (MOUTH_TALK_0, MOUTH_TALK_1, MOUTH_TALK_2)
+
 
 # --- Animations ---
 
