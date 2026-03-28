@@ -158,14 +158,18 @@ async def run_session(
   session: dict[str, Any] = {
     "type": "realtime",
     "model": model,
-    "audio": {"output": {"voice": voice}},
-    "turn_detection": _turn_detection_payload(
-      vad_mode=vad_mode,
-      vad_threshold=vad_threshold,
-      vad_silence_ms=vad_silence_ms,
-      vad_prefix_ms=vad_prefix_ms,
-      semantic_eagerness=semantic_eagerness,
-    ),
+    "audio": {
+      "output": {"voice": voice},
+      "input": {
+        "turn_detection": _turn_detection_payload(
+          vad_mode=vad_mode,
+          vad_threshold=vad_threshold,
+          vad_silence_ms=vad_silence_ms,
+          vad_prefix_ms=vad_prefix_ms,
+          semantic_eagerness=semantic_eagerness,
+        ),
+      },
+    },
   }
   if instructions:
     session["instructions"] = instructions
