@@ -38,25 +38,13 @@ use **far_field** noise shaping and a **higher VAD threshold**; raise ``--vad-th
 ``--semantic-eagerness low``.
 
 **Half-duplex uplink** (on by default): WebRTC uplink and (with ``--micd-suppress-during-assistant``)
-``rawAudioData`` are **fully muted** for the whole assistant ``response``. The client arms this gate
-**before** sending ``response.create`` so RTP does not carry real mic audio during API RTT (arming
-only after a successful send caused echo loops on body speakers). Assistant **downlink RTP** also
-calls ``ensure_response_active()`` on every decoded frame so the mic stays off if data-channel
-events lag behind audio. Server events (``response.created``, assistant ``output_item.added``,
-``output_audio_buffer.*``, ``response.output_audio.*``, ``response.audio.*``, etc.) still align timing.
-Stale mic samples in the uplink deque are **flushed** when the gate first arms.
-``MicdSuppressRawAudio`` uses a **blocking** params write on suppress 0→1 / 1→0 edges so micd picks
-it up within one 50 ms callback (the prior 10 ms nonblocking-only loop could lag).
-Mute holds from there through ``response.done`` plus the timing floor / optional soundd drain below.
-After ``response.done``, the client keeps the uplink off until an **API timing floor** (minimum hold
-after ``response.done``, ``response.output_audio_transcript.done``, and ``response.output_audio.done``)
-and, when ``soundd`` publishes ``sounddWebrtcQueueState`` (default on), until **the relevant PCM queue
-depth** has stayed at/below ``--soundd-queue-nonempty-epsilon-samples`` for
-``--soundd-stable-empty-ms`` plus ``--soundd-post-drain-hangover`` (room / OS buffer tail). If that
-telemetry is missing, the API floor alone applies. Defaults favor **lower latency**; if the mic
-picks up tail audio and retriggers, raise ``--half-duplex-min-after-response-done`` /
-``--half-duplex-after-transcript`` or ``--commit-grace-after-unmute``. Use ``--no-soundd-speaker-gate``
-for API-only timing, or ``--no-half-duplex`` for full-duplex (e.g. headset).
+``rawAudioData`` are muted while the assistant is “on the air”: from ``response.create`` (pre-RTT arm)
+until **``output_audio_buffer.stopped``** (or ``response.done`` if that event is missing), then until
+``soundd`` reports **``bodyRealtimeQueuedSamples`` ≤ ``--half-duplex-unmute-below-samples``** (needs
+``hasSplitTelemetry`` from current ``soundd``). Set samples to **0** to skip the queue check (faster
+unmute, more echo risk). ``--half-duplex-max-drain-wait`` caps how long we wait on the queue.
+``MicdSuppressRawAudio`` follows the same gate with blocking writes on 0↔1 edges. Use
+``--no-half-duplex`` for full-duplex (e.g. headset).
 
 **micd** (device ``rawAudioData``): with ``--micd-suppress-during-assistant`` (default on, requires
 half-duplex), the script sets param ``MicdSuppressRawAudio`` in lockstep with that gate so **micd**
@@ -150,7 +138,7 @@ _soundd_sr_mismatch_logged = False
 
 
 class _SounddQueueWatcher:
-  """Background SubMaster for ``sounddWebrtcQueueState`` (PCM queued before soundd's output callback drains it)."""
+  """Reads ``sounddWebrtcQueueState`` for half-duplex unmute (body queue depth vs threshold)."""
 
   def __init__(self) -> None:
     self._lock = threading.Lock()
@@ -204,121 +192,76 @@ class _SounddQueueWatcher:
       return self._has_split_telemetry
 
 
-class _ResponseHalfDuplexGate:
-  """Event-driven uplink mute: entire assistant response, then API timing floor + optional soundd queue drain.
-
-  Soundd queue gating is armed only in ``on_response_done`` so idle listening is not muted by
-  unrelated PCM in soundd’s webrtc deque or by stable-empty/hangover on startup.
-
-  When soundd publishes ``hasSplitTelemetry`` + ``bodyRealtimeQueuedSamples`` (current soundd), the
-  gate drains **only** the ``bodyRealtimeAudioData`` portion of the deque. The combined
-  ``queuedSamples`` also includes ``webrtcAudioData`` (e.g. webrtcd), which can hold a steady backlog
-  so the queue never looked “empty” and the mic stayed off too long.
-
-  The deque can still sit at a small steady backlog for the path we measure, so “drained” uses a
-  sample epsilon below which we treat the queue as empty, plus an optional max wait fallback.
-  """
+class _OutputBufferHalfDuplexGate:
+  """Mute using Realtime ``output_audio_buffer`` events + optional soundd body-queue threshold."""
 
   def __init__(
     self,
     *,
-    after_transcript_s: float,
-    after_audio_s: float,
-    after_response_done_min_s: float,
     soundd_queue: _SounddQueueWatcher | None,
-    soundd_stable_empty_s: float,
-    soundd_post_drain_hangover_s: float,
-    soundd_queue_nonempty_epsilon_samples: int,
-    soundd_max_drain_wait_s: float,
+    unmute_below_samples: int,
+    max_drain_wait_s: float,
     commit_grace_after_unmute_s: float,
   ) -> None:
-    self._after_transcript_s = after_transcript_s
-    self._after_audio_s = after_audio_s
-    self._after_response_done_min_s = after_response_done_min_s
     self._soundd_queue = soundd_queue
-    self._soundd_stable_empty_s = soundd_stable_empty_s
-    self._soundd_post_drain_hangover_s = soundd_post_drain_hangover_s
-    self._soundd_queue_nonempty_epsilon_samples = max(0, int(soundd_queue_nonempty_epsilon_samples))
-    self._soundd_max_drain_wait_s = float(soundd_max_drain_wait_s)
-    self._commit_grace_after_unmute_s = commit_grace_after_unmute_s
-    self._in_response = False
-    self._transcript_done_at: float | None = None
-    self._audio_done_at: float | None = None
-    self._api_release_at = 0.0
-    self._empty_since: float | None = None
-    self._hangover_until: float | None = None
+    self._unmute_below = max(0, int(unmute_below_samples))
+    self._max_drain_wait_s = float(max_drain_wait_s)
+    self._commit_grace_after_unmute_s = float(commit_grace_after_unmute_s)
+    self._pending_response = False
+    self._output_playing = False
+    self._drain_tail = False
+    self._drain_deadline: float | None = None
+    self._drain_force_logged = False
     self._was_suppressed = False
     self._commit_grace_until = 0.0
-    # Only run soundd queue / stable-empty / hangover after response.done. Otherwise idle would
-    # mute whenever queuedSamples>0 (other webrtc/body PCM) or force an extra hangover on startup.
-    self._armed_post_response_soundd = False
-    self._soundd_drain_deadline: float | None = None
-    self._soundd_drain_timeout_logged = False
     self._on_uplink_arm: Callable[[], None] | None = None
 
   def set_on_uplink_arm(self, fn: Callable[[], None] | None) -> None:
-    """Optional: e.g. flush BodyMicAudioTrack buffer when muting starts."""
     self._on_uplink_arm = fn
 
-  def _reset_post_done_drain(self) -> None:
-    self._empty_since = None
-    self._hangover_until = None
-
-  def _soundd_queue_nonempty(self, q: int) -> bool:
-    e = self._soundd_queue_nonempty_epsilon_samples
-    return q > e if e > 0 else q > 0
+  def _begin_drain_tail(self) -> None:
+    self._drain_tail = True
+    self._drain_force_logged = False
+    now = time.monotonic()
+    self._drain_deadline = (
+      now + self._max_drain_wait_s if self._max_drain_wait_s > 0.0 else None
+    )
 
   def suppress_uplink(self) -> bool:
     now = time.monotonic()
-    if self._in_response:
+    if self._pending_response or self._output_playing:
       result = True
-    elif now < self._api_release_at:
-      result = True
-    elif (
-      self._armed_post_response_soundd
-      and self._soundd_queue is not None
-      and self._soundd_queue.telemetry_ok()
-    ):
-      q = self._soundd_queue.gate_queue_depth_samples()
-      if (
-        self._soundd_max_drain_wait_s > 0.0
-        and self._soundd_drain_deadline is not None
-        and now >= self._soundd_drain_deadline
-      ):
-        if not self._soundd_drain_timeout_logged:
-          qt = self._soundd_queue.queued_samples()
-          LOG.warning(
-            "soundd speaker gate: drain wait exceeded %.1fs (gate_depth=%d total_queuedSamples=%d "
-            "body_split=%s); forcing uplink unmute",
-            self._soundd_max_drain_wait_s,
-            q,
-            qt,
-            self._soundd_queue.gate_uses_body_split(),
-          )
-          self._soundd_drain_timeout_logged = True
-        result = False
-      elif self._soundd_queue_nonempty(q):
-        self._reset_post_done_drain()
-        result = True
-      else:
-        if self._empty_since is None:
-          self._empty_since = now
-        if now - self._empty_since < self._soundd_stable_empty_s:
-          result = True
-        else:
-          if self._hangover_until is None:
-            self._hangover_until = now + self._soundd_post_drain_hangover_s
-          result = now < self._hangover_until
-    else:
+    elif not self._drain_tail:
       result = False
-
-    if (
-      self._armed_post_response_soundd
-      and not result
-      and not self._in_response
-      and now >= self._api_release_at
-    ):
-      self._armed_post_response_soundd = False
+    else:
+      sq = self._soundd_queue
+      if (
+        self._unmute_below <= 0
+        or sq is None
+        or not sq.telemetry_ok()
+        or not sq.gate_uses_body_split()
+      ):
+        self._drain_tail = False
+        result = False
+      elif sq.gate_queue_depth_samples() <= self._unmute_below:
+        self._drain_tail = False
+        result = False
+      elif (
+        self._max_drain_wait_s > 0.0
+        and self._drain_deadline is not None
+        and now >= self._drain_deadline
+      ):
+        if not self._drain_force_logged:
+          LOG.warning(
+            "half-duplex: max drain wait %.1fs elapsed (bodyQueued=%d); forcing uplink unmute",
+            self._max_drain_wait_s,
+            sq.gate_queue_depth_samples(),
+          )
+          self._drain_force_logged = True
+        self._drain_tail = False
+        result = False
+      else:
+        result = True
 
     if self._was_suppressed and not result:
       self._commit_grace_until = max(
@@ -335,57 +278,38 @@ class _ResponseHalfDuplexGate:
     return now < self._commit_grace_until
 
   def on_response_created(self) -> None:
-    # Idempotent: client may arm the gate before ``response.create`` is sent; server still emits
-    # ``response.created``. Do not reset transcript/audio clocks on the duplicate event.
-    if self._in_response:
+    """First arm per response (flush once); duplicate ``response.created`` does not flush again."""
+    if self._output_playing:
       return
-    self._in_response = True
-    self._transcript_done_at = None
-    self._audio_done_at = None
-    self._reset_post_done_drain()
-    if self._on_uplink_arm is not None:
+    if not self._pending_response and self._on_uplink_arm is not None:
       try:
         self._on_uplink_arm()
       except Exception:
         LOG.exception("half-duplex on_uplink_arm callback failed")
+    self._pending_response = True
 
   def rollback_response_arm(self) -> None:
-    """If ``response.create`` failed after we armed the gate, drop uplink mute."""
-    self._in_response = False
+    self._pending_response = False
+    self._output_playing = False
+    self._drain_tail = False
 
   def ensure_response_active(self) -> None:
-    """If response.created was missed, still mute from first output audio frame."""
-    if not self._in_response:
+    """Server already speaking (e.g. active_response error): stay muted until buffer/stop."""
+    if not self._output_playing:
       self.on_response_created()
 
-  def on_output_audio_transcript_done(self) -> None:
-    self._transcript_done_at = time.monotonic()
+  def on_output_buffer_started(self) -> None:
+    self._pending_response = False
+    self._output_playing = True
 
-  def on_output_audio_done(self) -> None:
-    self._audio_done_at = time.monotonic()
+  def on_output_buffer_stopped(self) -> None:
+    self._output_playing = False
+    self._begin_drain_tail()
 
   def on_response_done(self) -> None:
-    """Set API timing floor; after that, optional soundd drain + stable-empty + hangover extends mute."""
-    now = time.monotonic()
-    release = now + self._after_response_done_min_s
-    if self._transcript_done_at is not None:
-      release = max(release, self._transcript_done_at + self._after_transcript_s)
-    else:
-      release = max(release, now + self._after_transcript_s)
-    if self._audio_done_at is not None:
-      release = max(release, self._audio_done_at + self._after_audio_s)
-    else:
-      release = max(release, now + self._after_audio_s)
-    self._api_release_at = max(self._api_release_at, release)
-    self._in_response = False
-    self._transcript_done_at = None
-    self._audio_done_at = None
-    self._armed_post_response_soundd = True
-    self._soundd_drain_timeout_logged = False
-    self._soundd_drain_deadline = (
-      now + self._soundd_max_drain_wait_s if self._soundd_max_drain_wait_s > 0.0 else None
-    )
-    self._reset_post_done_drain()
+    self._pending_response = False
+    self._output_playing = False
+    self._begin_drain_tail()
 
 
 class _HalfDuplexMicTrack(BodyMicAudioTrack):
@@ -445,32 +369,14 @@ class _DebugMicTrack(BodyMicAudioTrack):
     return frame
 
 
-class _ArmHalfDuplexGateOnDownlinkFrame(MediaStreamTrack):
-  """Mute uplink as soon as assistant RTP arrives; data-channel events can lag behind audio."""
-
-  def __init__(self, track: MediaStreamTrack, arm: Callable[[], None]) -> None:
-    super().__init__()
-    self._track = track
-    self._arm = arm
-
-  @property
-  def kind(self) -> str:
-    return self._track.kind
-
-  async def recv(self):
-    self._arm()
-    return await self._track.recv()
-
-
-def _dc_event_triggers_output_audio_arm(typ: str) -> bool:
-  """Match current and legacy Realtime server event names for assistant audio output."""
-  if typ in ("response.output_audio_transcript.done", "response.output_audio.done"):
-    return False
-  if typ.startswith("response.output_audio.") or typ.startswith("output_audio_buffer."):
-    return True
-  if typ.startswith("response.audio."):
-    return True
-  return False
+_OUTPUT_BUFFER_STARTED_TYPES = frozenset({
+  "output_audio_buffer.started",
+  "response.output_audio_buffer.started",
+})
+_OUTPUT_BUFFER_STOPPED_TYPES = frozenset({
+  "output_audio_buffer.stopped",
+  "response.output_audio_buffer.stopped",
+})
 
 
 class _DebugHalfDuplexMicTrack(_HalfDuplexMicTrack):
@@ -659,16 +565,10 @@ async def run_session(
   playback_gain: float,
   output_speed: float,
   half_duplex: bool,
-  half_duplex_after_transcript_s: float,
-  half_duplex_after_audio_s: float,
-  half_duplex_after_response_done_min_s: float,
+  half_duplex_unmute_below_samples: int,
+  half_duplex_max_drain_wait_s: float,
   post_response_commit_cooldown_s: float,
   micd_suppress_during_assistant: bool,
-  soundd_speaker_gate: bool,
-  soundd_stable_empty_s: float,
-  soundd_post_drain_hangover_s: float,
-  soundd_queue_nonempty_epsilon_samples: int,
-  soundd_max_drain_wait_s: float,
   commit_grace_after_unmute_s: float,
   log_user_speech: bool,
   input_transcription: bool,
@@ -683,21 +583,16 @@ async def run_session(
 ) -> None:
   loop = asyncio.get_running_loop()
   soundd_watcher: _SounddQueueWatcher | None = None
-  if half_duplex and soundd_speaker_gate:
+  if half_duplex and half_duplex_unmute_below_samples > 0:
     soundd_watcher = _SounddQueueWatcher()
     soundd_watcher.start()
 
-  gate: _ResponseHalfDuplexGate | None = None
+  gate: _OutputBufferHalfDuplexGate | None = None
   if half_duplex:
-    gate = _ResponseHalfDuplexGate(
-      after_transcript_s=half_duplex_after_transcript_s,
-      after_audio_s=half_duplex_after_audio_s,
-      after_response_done_min_s=half_duplex_after_response_done_min_s,
+    gate = _OutputBufferHalfDuplexGate(
       soundd_queue=soundd_watcher,
-      soundd_stable_empty_s=soundd_stable_empty_s,
-      soundd_post_drain_hangover_s=soundd_post_drain_hangover_s,
-      soundd_queue_nonempty_epsilon_samples=soundd_queue_nonempty_epsilon_samples,
-      soundd_max_drain_wait_s=soundd_max_drain_wait_s,
+      unmute_below_samples=half_duplex_unmute_below_samples,
+      max_drain_wait_s=half_duplex_max_drain_wait_s,
       commit_grace_after_unmute_s=commit_grace_after_unmute_s,
     )
 
@@ -756,25 +651,15 @@ async def run_session(
   if gate is not None:
     if soundd_watcher is not None:
       LOG.info(
-        "half-duplex uplink: mute through each response; after API floor (max response.done+%.2fs, "
-        "transcript.done+%.2fs, output_audio.done+%.2fs), also wait for soundd drain "
-        "(gate depth: bodyRealtimeQueuedSamples when soundd hasSplitTelemetry else combined "
-        "queuedSamples; <=%d treated empty, stable %.0fms + %.2fs hangover; max wait %.1fs from response.done)",
-        half_duplex_after_response_done_min_s,
-        half_duplex_after_transcript_s,
-        half_duplex_after_audio_s,
-        soundd_queue_nonempty_epsilon_samples,
-        soundd_stable_empty_s * 1000.0,
-        soundd_post_drain_hangover_s,
-        soundd_max_drain_wait_s,
+        "half-duplex: mute from response.create until output_audio_buffer.stopped/response.done; "
+        "unmute when bodyRealtimeQueuedSamples<=%d (max drain wait %.1fs)",
+        half_duplex_unmute_below_samples,
+        half_duplex_max_drain_wait_s,
       )
     else:
       LOG.info(
-        "half-duplex uplink: mute through each response; unmute after max(response.done+%.2fs, "
-        "transcript.done+%.2fs, output_audio.done+%.2fs)",
-        half_duplex_after_response_done_min_s,
-        half_duplex_after_transcript_s,
-        half_duplex_after_audio_s,
+        "half-duplex: mute from response.create until output_audio_buffer.stopped/response.done; "
+        "queue threshold disabled (unmute_below=0)",
       )
     if micd_suppress_during_assistant:
       LOG.info("micd: MicdSuppressRawAudio follows half-duplex (rawAudioData silence while gated)")
@@ -1020,17 +905,10 @@ async def run_session(
     if gate is not None:
       if typ == "response.created":
         gate.on_response_created()
-      elif typ == "response.output_item.added":
-        item = ev.get("item")
-        if isinstance(item, dict) and item.get("type") == "message" and item.get("role") == "assistant":
-          gate.ensure_response_active()
-      elif typ == "response.output_audio_transcript.done":
-        gate.on_output_audio_transcript_done()
-      elif typ == "response.output_audio.done":
-        gate.on_output_audio_done()
-      elif _dc_event_triggers_output_audio_arm(typ):
-        # WebRTC: most audio is RTP; DC names vary by API revision — see _dc_event_triggers_output_audio_arm.
-        gate.ensure_response_active()
+      elif typ in _OUTPUT_BUFFER_STARTED_TYPES:
+        gate.on_output_buffer_started()
+      elif typ in _OUTPUT_BUFFER_STOPPED_TYPES:
+        gate.on_output_buffer_stopped()
     if typ in ("response.output_audio_transcript.delta", "response.output_text.delta"):
       d = ev.get("delta", "")
       if d:
@@ -1086,8 +964,6 @@ async def run_session(
       return
     audio_to_speaker_started = True
     LOG.info("starting BodySpeaker for remote audio downlink")
-    if half_duplex and gate is not None:
-      track = _ArmHalfDuplexGateOnDownlinkFrame(track, gate.ensure_response_active)
     speaker.start_track(track)
 
   pc.addTrack(mic)
@@ -1246,79 +1122,36 @@ def main() -> None:
     "--half-duplex/--no-half-duplex",
     dest="half_duplex",
     default=True,
-    help="Mute WebRTC uplink for each assistant response (response.created→done) plus tail timing below",
+    help="Mute uplink during assistant playback (output_audio_buffer + response.create arm; unmute via queue threshold)",
   )
   parser.add_argument(
-    "--half-duplex-after-transcript",
-    type=float,
-    default=0.5,
-    metavar="SEC",
-    help="Keep uplink muted at least this long after response.output_audio_transcript.done (default 0.5; raise if echo)",
+    "--half-duplex-unmute-below-samples",
+    type=int,
+    default=9600,
+    metavar="N",
+    help="After output stops, unmute when soundd bodyRealtimeQueuedSamples<=N (~9600≈200ms at 48kHz); "
+    "0=skip queue check (faster, more echo). Requires soundd split telemetry",
   )
   parser.add_argument(
-    "--half-duplex-after-audio",
+    "--half-duplex-max-drain-wait",
     type=float,
-    default=0.25,
+    default=3.0,
     metavar="SEC",
-    help="Keep uplink muted at least this long after response.output_audio.done (default 0.25)",
-  )
-  parser.add_argument(
-    "--half-duplex-min-after-response-done",
-    type=float,
-    default=0.3,
-    metavar="SEC",
-    help="Minimum uplink mute after response.done (before transcript/audio math); default 0.3 (was 2.0)",
+    help="Force uplink unmute after this long waiting for queue<=threshold (0=disable timeout; default 3)",
   )
   parser.add_argument(
     "--post-response-commit-cooldown",
     type=float,
-    default=1.15,
+    default=0.72,
     metavar="SEC",
     help="Do not send response.create on input_audio_buffer.committed until this long after response.done "
-    "(default 1.15; increase if commits race before uplink unmutes)",
+    "(default 0.72; increase if commits race before uplink unmutes)",
   )
   parser.add_argument(
     "--micd-suppress-during-assistant/--no-micd-suppress-during-assistant",
     dest="micd_suppress_during_assistant",
     default=True,
     help="With half-duplex, set MicdSuppressRawAudio so micd publishes silence on rawAudioData while gated (default on)",
-  )
-  parser.add_argument(
-    "--soundd-speaker-gate/--no-soundd-speaker-gate",
-    dest="soundd_speaker_gate",
-    default=True,
-    help="With half-duplex, keep uplink muted until soundd’s PCM gate depth is drained (sounddWebrtcQueueState: "
-    "bodyRealtimeQueuedSamples when hasSplitTelemetry, else combined queue); "
-    "falls back to API-only timing if telemetry is absent (default on)",
-  )
-  parser.add_argument(
-    "--soundd-stable-empty-ms",
-    type=float,
-    default=50.0,
-    metavar="MS",
-    help="With --soundd-speaker-gate, require queue at/below epsilon for this long before hangover (default 50)",
-  )
-  parser.add_argument(
-    "--soundd-post-drain-hangover",
-    type=float,
-    default=0.15,
-    metavar="SEC",
-    help="With --soundd-speaker-gate, extra mute after stable-empty queue (default 0.15)",
-  )
-  parser.add_argument(
-    "--soundd-queue-nonempty-epsilon-samples",
-    type=int,
-    default=7200,
-    metavar="N",
-    help="With --soundd-speaker-gate, treat gate depth<=N as empty (~7200≈150ms at 48kHz; 0=strict; "
-    "gate depth is body-only when soundd publishes hasSplitTelemetry)",
-  )
-  parser.add_argument(
-    "--soundd-max-drain-wait",
-    type=float,
-    default=15.0,
-    metavar="SEC",
-    help="With --soundd-speaker-gate, force uplink unmute after this long waiting on the queue (0=disable)",
   )
   parser.add_argument(
     "--commit-grace-after-unmute",
@@ -1403,26 +1236,14 @@ def main() -> None:
   if not 0.0 <= args.vad_threshold <= 1.0:
     print("--vad-threshold must be between 0 and 1", file=sys.stderr)
     sys.exit(1)
-  if args.half_duplex_after_transcript < 0 or args.half_duplex_after_audio < 0:
-    print("--half-duplex-after-transcript and --half-duplex-after-audio must be >= 0", file=sys.stderr)
-    sys.exit(1)
-  if args.half_duplex_min_after_response_done < 0:
-    print("--half-duplex-min-after-response-done must be >= 0", file=sys.stderr)
+  if args.half_duplex_unmute_below_samples < 0:
+    print("--half-duplex-unmute-below-samples must be >= 0", file=sys.stderr)
     sys.exit(1)
   if args.post_response_commit_cooldown < 0:
     print("--post-response-commit-cooldown must be >= 0", file=sys.stderr)
     sys.exit(1)
-  if args.soundd_stable_empty_ms < 0:
-    print("--soundd-stable-empty-ms must be >= 0", file=sys.stderr)
-    sys.exit(1)
-  if args.soundd_post_drain_hangover < 0:
-    print("--soundd-post-drain-hangover must be >= 0", file=sys.stderr)
-    sys.exit(1)
-  if args.soundd_queue_nonempty_epsilon_samples < 0:
-    print("--soundd-queue-nonempty-epsilon-samples must be >= 0", file=sys.stderr)
-    sys.exit(1)
-  if args.soundd_max_drain_wait < 0:
-    print("--soundd-max-drain-wait must be >= 0", file=sys.stderr)
+  if args.half_duplex_max_drain_wait < 0:
+    print("--half-duplex-max-drain-wait must be >= 0", file=sys.stderr)
     sys.exit(1)
   if args.commit_grace_after_unmute < 0:
     print("--commit-grace-after-unmute must be >= 0", file=sys.stderr)
@@ -1483,16 +1304,10 @@ def main() -> None:
         playback_gain=args.playback_gain,
         output_speed=args.output_speed,
         half_duplex=args.half_duplex,
-        half_duplex_after_transcript_s=args.half_duplex_after_transcript,
-        half_duplex_after_audio_s=args.half_duplex_after_audio,
-        half_duplex_after_response_done_min_s=args.half_duplex_min_after_response_done,
+        half_duplex_unmute_below_samples=args.half_duplex_unmute_below_samples,
+        half_duplex_max_drain_wait_s=args.half_duplex_max_drain_wait,
         post_response_commit_cooldown_s=args.post_response_commit_cooldown,
         micd_suppress_during_assistant=args.micd_suppress_during_assistant,
-        soundd_speaker_gate=args.soundd_speaker_gate,
-        soundd_stable_empty_s=args.soundd_stable_empty_ms / 1000.0,
-        soundd_post_drain_hangover_s=args.soundd_post_drain_hangover,
-        soundd_queue_nonempty_epsilon_samples=args.soundd_queue_nonempty_epsilon_samples,
-        soundd_max_drain_wait_s=args.soundd_max_drain_wait,
         commit_grace_after_unmute_s=args.commit_grace_after_unmute,
         log_user_speech=args.log_user_speech,
         input_transcription=args.input_transcription,
