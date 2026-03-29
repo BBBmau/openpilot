@@ -12,7 +12,7 @@ import capnp
 from cereal import messaging, log
 
 from openpilot.system.webrtc.webrtcd import CerealOutgoingMessageProxy, CerealIncomingMessageProxy
-from openpilot.system.webrtc.device.video import LiveStreamVideoStreamTrack
+from openpilot.system.webrtc.device.video import LIVESTREAM_KEYFRAME_FLAG, LiveStreamVideoStreamTrack
 
 
 class TestStreamSession:
@@ -68,6 +68,8 @@ class TestStreamSession:
 
   def test_livestream_track(self, mocker):
     fake_msg = messaging.new_message("livestreamDriverEncodeData")
+    fake_msg.livestreamDriverEncodeData.idx.flags = LIVESTREAM_KEYFRAME_FLAG
+    fake_msg.livestreamDriverEncodeData.data = b"\x00\x00\x00\x01\x65stub"
 
     config = {"receive.return_value": fake_msg.to_bytes()}
     mocker.patch("msgq.SubSocket", spec=True, **config)
@@ -83,4 +85,4 @@ class TestStreamSession:
         start_ns = time.monotonic_ns()
         start_pts = packet.pts
       assert abs(i + packet.pts - (start_pts + (((time.monotonic_ns() - start_ns) * VIDEO_CLOCK_RATE) // 1_000_000_000))) < 450 #5ms
-      assert packet.size == 0
+      assert packet.size == len(fake_msg.livestreamDriverEncodeData.data)

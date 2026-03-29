@@ -14,6 +14,9 @@ TIMING_SEI_UUID = bytes([
   0x9c, 0x7e, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc,
 ])
 
+# EncodeIndex.flags — same as V4L2_BUF_FLAG_KEYFRAME in system/loggerd/encoder/encoder.h
+LIVESTREAM_KEYFRAME_FLAG = 8
+
 
 def _escape_rbsp(data: bytes) -> bytearray:
   """Insert H.264 emulation-prevention bytes (0x03) where required."""
@@ -58,39 +61,53 @@ class LiveStreamVideoStreamTrack(TiciVideoStreamTrack):
     self._pts = 0
     self._t0_ns = time.monotonic_ns()
     self.timing_sei_enabled = False
+    # WebRTC peer decoders need SPS/PPS (EncodeData.header is only set on keyframes in encoder.cc).
+    # If we start on a P-frame, nothing decodes until the next IDR — skip until the first keyframe.
+    self._need_keyframe = True
 
   def switch_camera(self, camera_type: str):
     if camera_type not in self.camera_to_sock_mapping or camera_type == self._camera_type:
       return
     self._camera_type = camera_type
     self._sock = messaging.sub_sock(self.camera_to_sock_mapping[camera_type], conflate=False)
+    self._need_keyframe = True
 
   async def recv(self):
     while True:
-      msg = messaging.recv_one_or_none(self._sock)
-      if msg is not None:
-        break
-      await asyncio.sleep(0.005)
+      while True:
+        msg = messaging.recv_one_or_none(self._sock)
+        if msg is not None:
+          break
+        await asyncio.sleep(0.005)
 
-    evta = getattr(msg, msg.which())
+      evta = getattr(msg, msg.which())
+      idx = evta.idx
+      if self._need_keyframe and not (idx.flags & LIVESTREAM_KEYFRAME_FLAG):
+        continue
 
-    frame_data = evta.header + evta.data
-    if self.timing_sei_enabled:
-      capture_ms = (evta.idx.timestampEof - evta.idx.timestampSof) / 1e6
-      encode_ms = (msg.logMonoTime - evta.idx.timestampEof) / 1e6
-      send_delay_ms = (time.monotonic_ns() - msg.logMonoTime) / 1e6
-      send_wall_ms = time.time() * 1000  # noqa: TID251
-      sei_nal = create_timing_sei(capture_ms, encode_ms, send_delay_ms, send_wall_ms)
-      frame_data = evta.header + sei_nal + evta.data
+      frame_data = evta.header + evta.data
+      if not frame_data:
+        continue
 
-    packet = av.Packet(frame_data)
-    packet.time_base = self._time_base
+      if self._need_keyframe:
+        self._need_keyframe = False
 
-    self._pts = ((time.monotonic_ns() - self._t0_ns) * self._clock_rate) // 1_000_000_000
-    packet.pts = self._pts
-    self.log_debug("track sending frame %d", self._pts)
+      if self.timing_sei_enabled:
+        capture_ms = (evta.idx.timestampEof - evta.idx.timestampSof) / 1e6
+        encode_ms = (msg.logMonoTime - evta.idx.timestampEof) / 1e6
+        send_delay_ms = (time.monotonic_ns() - msg.logMonoTime) / 1e6
+        send_wall_ms = time.time() * 1000  # noqa: TID251
+        sei_nal = create_timing_sei(capture_ms, encode_ms, send_delay_ms, send_wall_ms)
+        frame_data = evta.header + sei_nal + evta.data
 
-    return packet
+      packet = av.Packet(frame_data)
+      packet.time_base = self._time_base
+
+      self._pts = ((time.monotonic_ns() - self._t0_ns) * self._clock_rate) // 1_000_000_000
+      packet.pts = self._pts
+      self.log_debug("track sending frame %d", self._pts)
+
+      return packet
 
   def codec_preference(self) -> str | None:
     return "H264"

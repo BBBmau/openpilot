@@ -233,9 +233,9 @@ def _log_livestream_pipeline_diagnosis(cameras: list[str], params: Params) -> No
   if got:
     cloudlog.warning(
       "body_random_walkd: pipeline: got %s on %s within %.1fs (logMonoTime=%s) — "
-      "msgq is fine; if BodyEnv.reset still times out, webrtcd was likely feeding the peer with "
-      "conflated P-frames (empty EncodeData header until keyframe). Use LiveStreamVideoStreamTrack "
-      "with conflate=False (system/webrtc/device/video.py). Otherwise check ICE/SDP or bodyjim decode.",
+      "msgq is fine; if BodyEnv.reset still times out, check WebRTC (ICE/SDP), bodyjim decode, or "
+      "that LiveStreamVideoStreamTrack starts on a keyframe (SPS/PPS only on IDRs in encoder.cc; "
+      "see system/webrtc/device/video.py).",
       got,
       service,
       probe_s,
