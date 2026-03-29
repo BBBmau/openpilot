@@ -9,6 +9,29 @@ from openpilot.system.manager.process import PythonProcess, NativeProcess, Daemo
 
 WEBCAM = os.getenv("USE_WEBCAM") is not None
 
+_cached_is_body: bool | None = None
+def _is_body(CP: car.CarParams, params: Params) -> bool:
+  """Check notCar from live CarParams, falling back to CarParamsPersistent.
+
+  card only publishes carParams when onroad. For body-specific processes that
+  must run offroad (micd, bodywaked), we need to know it's a body before card
+  has ever published in this manager session.
+  """
+  global _cached_is_body
+  if CP.notCar:
+    _cached_is_body = True
+    return True
+  if _cached_is_body is not None:
+    return _cached_is_body
+  cp_bytes = params.get("CarParamsPersistent")
+  if cp_bytes:
+    try:
+      _cached_is_body = car.CarParams.from_bytes(cp_bytes).notCar
+      return _cached_is_body
+    except Exception:
+      pass
+  return False
+
 def driverview(started: bool, params: Params, CP: car.CarParams) -> bool:
   """Vision for UI / DM; on comma body also when ``LiveIgnition`` so ``stream_encoderd`` can attach."""
   if started or params.get_bool("IsDriverViewEnabled"):
@@ -57,7 +80,7 @@ def only_onroad(started: bool, params: Params, CP: car.CarParams) -> bool:
 
 def micd_onroad_or_body(started: bool, params: Params, CP: car.CarParams) -> bool:
   """Comma body needs the mic while nominally offroad so wake-word can bring the UI 'onroad'."""
-  return started or CP.notCar
+  return started or _is_body(CP, params)
 
 
 def soundd_should_run(started: bool, params: Params, CP: car.CarParams) -> bool:
@@ -72,7 +95,7 @@ def soundd_should_run(started: bool, params: Params, CP: car.CarParams) -> bool:
 
 
 def bodywaked_should_run(started: bool, params: Params, CP: car.CarParams) -> bool:
-  return CP.notCar and params.get_bool("BodyWakeWordEnabled")
+  return _is_body(CP, params) and params.get_bool("BodyWakeWordEnabled")
 
 
 def comma_body_stack_should_run(started: bool, params: Params, CP: car.CarParams) -> bool:
