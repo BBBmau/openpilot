@@ -102,10 +102,10 @@ def comma_body_stack_should_run(started: bool, params: Params, CP: car.CarParams
   """Comma body: WebRTC/bridge/random-walk run when ignition is on.
 
   Uses _is_body fallback so the stack starts even before card publishes
-  carParams (e.g. wake-word boot).  Checks BodyWakeIgnition in addition to
-  LiveIgnition so software-triggered ignition is recognised immediately.
+  carParams (e.g. wake-word boot).  BodyWakeWordEnabled acts as a secondary
+  body-device indicator when CarParamsPersistent is unavailable.
   """
-  if not _is_body(CP, params):
+  if not (_is_body(CP, params) or params.get_bool("BodyWakeWordEnabled")):
     return False
   return started or params.get_bool("LiveIgnition") or params.get_bool("BodyWakeIgnition")
 
