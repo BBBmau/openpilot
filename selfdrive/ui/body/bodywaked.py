@@ -35,7 +35,7 @@ SUMMARY_INTERVAL_S = 10.0
 MODEL_DIR = Path(__file__).parent / "models"
 MELSPEC_MODEL = MODEL_DIR / "melspectrogram.onnx"
 EMBEDDING_MODEL = MODEL_DIR / "embedding_model.onnx"
-DEFAULT_WW_MODEL = MODEL_DIR / "hey_jarvis_v0.1.onnx"
+DEFAULT_WW_MODEL = MODEL_DIR / "hey_comma_v17_big.onnx"
 
 
 def _log(msg: str):
