@@ -248,6 +248,7 @@ class _OutputBufferHalfDuplexGate:
     self._drain_deadline: float | None = None
     self._drain_force_logged = False
     self._post_drain_mute_until = 0.0
+    self._force_suppress_until = 0.0
     self._was_suppressed = False
     self._commit_grace_until = 0.0
     self._on_uplink_arm: Callable[[], None] | None = None
@@ -259,6 +260,13 @@ class _OutputBufferHalfDuplexGate:
   def set_on_unmute(self, fn: Callable[[], None] | None) -> None:
     self._on_unmute = fn
 
+  def force_suppress_until(self, deadline: float) -> None:
+    """Force mic to send silence until *deadline* (monotonic). Used by echo-loop detector."""
+    self._force_suppress_until = max(self._force_suppress_until, deadline)
+    self._drain_tail = False
+    self._pending_response = False
+    self._output_playing = False
+
   def _begin_drain_tail(self) -> None:
     self._drain_tail = True
     self._drain_force_logged = False
@@ -269,39 +277,51 @@ class _OutputBufferHalfDuplexGate:
 
   def suppress_uplink(self) -> bool:
     now = time.monotonic()
-    if self._pending_response or self._output_playing:
+    if now < self._force_suppress_until:
+      result = True
+    elif self._pending_response or self._output_playing:
       result = True
     elif self._drain_tail:
-      drain_timeout = (
+      sa = self._speaker_activity
+      speaker_live = sa is not None and sa.is_active()
+      sq = self._soundd_queue
+      soundd_ok = (
+        self._unmute_below > 0
+        and sq is not None
+        and sq.telemetry_ok()
+        and sq.gate_uses_body_split()
+      )
+      soft_timeout = (
         self._max_drain_wait_s > 0.0
         and self._drain_deadline is not None
         and now >= self._drain_deadline
       )
-      if drain_timeout:
+      hard_timeout = (
+        self._drain_deadline is not None
+        and now >= self._drain_deadline + self._max_drain_wait_s
+      )
+      if hard_timeout:
         if not self._drain_force_logged:
-          LOG.warning("half-duplex: max drain wait %.1fs elapsed; forcing uplink unmute", self._max_drain_wait_s)
+          LOG.warning("half-duplex: hard drain cap %.1fs; forcing uplink unmute", self._max_drain_wait_s * 2)
           self._drain_force_logged = True
         self._drain_tail = False
         self._post_drain_mute_until = now + self._commit_grace_after_unmute_s
         result = True
+      elif soft_timeout and not speaker_live:
+        if not self._drain_force_logged:
+          LOG.warning("half-duplex: drain wait %.1fs elapsed, speaker quiet; unmuting", self._max_drain_wait_s)
+          self._drain_force_logged = True
+        self._drain_tail = False
+        self._post_drain_mute_until = now + self._commit_grace_after_unmute_s
+        result = True
+      elif speaker_live:
+        result = True
+      elif soundd_ok and sq.gate_queue_depth_samples() > self._unmute_below:
+        result = True
       else:
-        sa = self._speaker_activity
-        speaker_live = sa is not None and sa.is_active()
-        sq = self._soundd_queue
-        soundd_ok = (
-          self._unmute_below > 0
-          and sq is not None
-          and sq.telemetry_ok()
-          and sq.gate_uses_body_split()
-        )
-        if speaker_live:
-          result = True
-        elif soundd_ok and sq.gate_queue_depth_samples() > self._unmute_below:
-          result = True
-        else:
-          self._drain_tail = False
-          self._post_drain_mute_until = now + self._commit_grace_after_unmute_s
-          result = True
+        self._drain_tail = False
+        self._post_drain_mute_until = now + self._commit_grace_after_unmute_s
+        result = True
     elif now < self._post_drain_mute_until:
       result = True
     else:
@@ -769,9 +789,9 @@ async def run_session(
   ignore_response_create_until = [0.0]
   response_busy = False
   _recent_response_ts: list[float] = []
-  _LOOP_WINDOW_S = 12.0
-  _LOOP_THRESHOLD = 2
-  _LOOP_COOLDOWN_S = 10.0
+  _LOOP_WINDOW_S = 15.0
+  _LOOP_THRESHOLD = 3
+  _LOOP_COOLDOWN_S = 6.0
 
   responses_done_ids: set[str] = set()
   response_done_waiters: dict[str, asyncio.Event] = {}
@@ -870,17 +890,46 @@ async def run_session(
         gate.rollback_response_arm()
       return
 
-  def _on_input_committed() -> None:
+  _phantom_item_ids: list[str] = []
+
+  def _reject_committed_item(item_id: str | None, reason: str) -> None:
+    """Track a rejected committed item for deferred deletion and clear pending audio."""
+    if item_id:
+      _phantom_item_ids.append(item_id)
+      LOG.debug("tracking phantom committed item %s (%s)", item_id, reason)
+    if dc.readyState == "open":
+      try:
+        dc.send(json.dumps({"type": "input_audio_buffer.clear"}))
+      except Exception:
+        pass
+
+  def _flush_phantom_items() -> None:
+    """Delete all tracked phantom items right before a real response.create."""
+    if not _phantom_item_ids or dc.readyState != "open":
+      _phantom_item_ids.clear()
+      return
+    for iid in _phantom_item_ids:
+      try:
+        dc.send(json.dumps({"type": "conversation.item.delete", "item_id": iid}))
+      except Exception:
+        pass
+    LOG.debug("deleted %d phantom items before response.create", len(_phantom_item_ids))
+    _phantom_item_ids.clear()
+
+  def _on_input_committed(item_id: str | None = None) -> None:
     nonlocal response_busy
     if server_auto_response:
       return
     if vision_suppress_commits[0] > 0:
+      _reject_committed_item(item_id, "vision tool active")
       LOG.debug("input_audio_buffer.committed during screen vision tool; skip response.create")
       return
     if gate is not None and gate.commit_blocked():
+      _reject_committed_item(item_id, "half-duplex gate")
       LOG.debug("half-duplex gate or post-unmute grace; not scheduling response.create")
       return
     if response_busy:
+      _reject_committed_item(item_id, "response active")
       LOG.debug(
         "input_audio_buffer.committed while response active; not scheduling response.create "
         "(echo-loop guard)",
@@ -888,12 +937,14 @@ async def run_session(
       return
     now = time.monotonic()
     if now < ignore_response_create_until[0]:
+      _reject_committed_item(item_id, "post-response cooldown")
       LOG.debug(
         "input_audio_buffer.committed during post-response cooldown; not scheduling response.create "
         "(%.2fs left)",
         ignore_response_create_until[0] - now,
       )
       return
+    _flush_phantom_items()
     _send_response_create()
 
   def _on_response_done() -> None:
@@ -943,7 +994,7 @@ async def run_session(
       elif typ == "conversation.item.input_audio_transcription.failed":
         print(f"[user speech transcript] FAILED {ev}", file=sys.stderr, flush=True)
     if typ == "input_audio_buffer.committed" and not server_auto_response:
-      _on_input_committed()
+      _on_input_committed(item_id=ev.get("item_id"))
     elif typ == "response.done":
       resp_obj = ev.get("response")
       if isinstance(resp_obj, dict):
@@ -959,14 +1010,23 @@ async def run_session(
       _recent_response_ts[:] = [t for t in _recent_response_ts if now_sync - t < _LOOP_WINDOW_S]
       if len(_recent_response_ts) >= _LOOP_THRESHOLD:
         LOG.warning(
-          "echo loop detected: %d responses in %.0fs; extending cooldown %.1fs",
+          "echo loop detected: %d responses in %.0fs; muting mic for %.1fs",
           len(_recent_response_ts), _LOOP_WINDOW_S, _LOOP_COOLDOWN_S,
         )
+        cooldown_deadline = now_sync + _LOOP_COOLDOWN_S
         ignore_response_create_until[0] = max(
           ignore_response_create_until[0],
-          now_sync + _LOOP_COOLDOWN_S,
+          cooldown_deadline,
         )
+        if gate is not None:
+          gate.force_suppress_until(cooldown_deadline)
         _recent_response_ts.clear()
+        _phantom_item_ids.clear()
+        if dc.readyState == "open":
+          try:
+            dc.send(json.dumps({"type": "input_audio_buffer.clear"}))
+          except Exception:
+            pass
       if dc.readyState == "open":
         try:
           dc.send(json.dumps({"type": "input_audio_buffer.clear"}))
@@ -1034,9 +1094,9 @@ async def run_session(
 
     def _on_uplink_unmute() -> None:
       _clear_input_buffer()
-      loop.call_later(0.4, _clear_input_buffer)
-      loop.call_later(0.8, _clear_input_buffer)
-      LOG.debug("half-duplex: input_audio_buffer.clear on unmute (+ delayed)")
+      for delay in (0.3, 0.6, 1.0, 1.5, 2.0):
+        loop.call_later(delay, _clear_input_buffer)
+      LOG.debug("half-duplex: input_audio_buffer.clear on unmute (+ staggered clears)")
       ignore_response_create_until[0] = max(
         ignore_response_create_until[0],
         time.monotonic() + post_response_commit_cooldown_s,
@@ -1254,27 +1314,27 @@ def main() -> None:
   parser.add_argument(
     "--half-duplex-max-drain-wait",
     type=float,
-    default=3.0,
+    default=5.0,
     metavar="SEC",
-    help="Force uplink unmute after this long waiting for queue<=threshold (0=disable timeout; default 3)",
+    help="Soft drain timeout: unmute only if speaker is quiet after this; hard cap at 2x. (0=disable; default 5)",
   )
   parser.add_argument(
     "--speaker-tail",
     type=float,
-    default=0.8,
+    default=1.5,
     metavar="SEC",
     help=(
       "Keep mic muted for this long after the last non-silent audio output to the speaker "
-      "(local PCM tracking; avoids echo when soundd queue telemetry is unavailable; 0=disable; default 0.8)"
+      "(local PCM tracking; avoids echo when soundd queue telemetry is unavailable; 0=disable; default 1.5)"
     ),
   )
   parser.add_argument(
     "--post-response-commit-cooldown",
     type=float,
-    default=1.5,
+    default=2.5,
     metavar="SEC",
     help="Do not send response.create on input_audio_buffer.committed until this long after response.done / unmute "
-    "(default 1.5; increase if echo commits still slip through)",
+    "(default 2.5; increase if echo commits still slip through)",
   )
   parser.add_argument(
     "--micd-suppress-during-assistant/--no-micd-suppress-during-assistant",
@@ -1285,10 +1345,10 @@ def main() -> None:
   parser.add_argument(
     "--commit-grace-after-unmute",
     type=float,
-    default=1.0,
+    default=2.0,
     metavar="SEC",
     help="Post-drain silence period: mic sends silence this long after speaker drain, then blocks commits equally long "
-    "(default 1.0; covers room echo + VAD latency)",
+    "(default 2.0; covers room echo + VAD latency)",
   )
   parser.add_argument(
     "--log-user-speech/--no-log-user-speech",
