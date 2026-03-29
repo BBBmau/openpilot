@@ -19,8 +19,9 @@ TIMING_SEI_UUID = bytes([
 LIVESTREAM_KEYFRAME_FLAG = 8
 
 
-def _h264_annex_b_has_sps_pps_or_idr(data: bytes) -> bool:
-  """True if Annex-B H.264 contains SPS (7), PPS (8), or IDR slice (5)."""
+def _h264_annex_b_scan_nal_types(data: bytes) -> set[int]:
+  """Return NAL unit types (lower 5 bits of first RBSP byte) found in Annex-B ``data``."""
+  types: set[int] = set()
   n = len(data)
   i = 0
   while i < n:
@@ -32,20 +33,25 @@ def _h264_annex_b_has_sps_pps_or_idr(data: bytes) -> bool:
       i += 1
       continue
     pos = i + sc
-    if pos < n and (data[pos] & 0x1F) in (5, 7, 8):
-      return True
+    if pos < n:
+      types.add(data[pos] & 0x1F)
     i = pos
+  return types
 
-  return False
+
+def _h264_annex_b_has_idr_slice(data: bytes) -> bool:
+  return 5 in _h264_annex_b_scan_nal_types(data)
 
 
-def _livestream_frame_is_decoder_sync_point(idx_flags: int, header: bytes, frame_data: bytes) -> bool:
-  """First RTP must carry something a decoder can sync from (see encoder.cc header + V4L separate mode)."""
+def _livestream_is_keyframe_or_idr_au(idx_flags: int, frame_data: bytes) -> bool:
+  """
+  First packet we send must start a decodable picture. SPS/PPS alone (e.g. ``repeat_codec_header`` on
+  every frame) is not enough: a leading P-slice references frames the WebRTC peer does not have,
+  so PyAV never emits a :class:`av.VideoFrame` and bodyjim ``recv()`` times out.
+  """
   if idx_flags & LIVESTREAM_KEYFRAME_FLAG:
     return True
-  if header:
-    return True
-  return _h264_annex_b_has_sps_pps_or_idr(frame_data)
+  return _h264_annex_b_has_idr_slice(frame_data)
 
 
 def _ensure_annex_b_start_before_slice(data: bytes) -> bytes:
@@ -71,6 +77,7 @@ def livestream_encode_data_diag(msg: Any) -> dict[str, bool | int | str]:
   dat = bytes(evta.data)
   frame = hdr + dat
   sc = dat.startswith(b"\x00\x00\x01") or dat.startswith(b"\x00\x00\x00\x01")
+  nal_types = _h264_annex_b_scan_nal_types(frame)
   return {
     "which": which,
     "encode_type": str(idx.type),
@@ -78,7 +85,9 @@ def livestream_encode_data_diag(msg: Any) -> dict[str, bool | int | str]:
     "header_bytes": len(hdr),
     "data_bytes": len(dat),
     "keyframe_bit": bool(idx.flags & LIVESTREAM_KEYFRAME_FLAG),
-    "sync_ok": _livestream_frame_is_decoder_sync_point(idx.flags, hdr, frame),
+    "sync_ok": _livestream_is_keyframe_or_idr_au(idx.flags, frame),
+    "has_codec_header": len(hdr) > 0,
+    "nal_types_sample": ",".join(str(t) for t in sorted(nal_types)) if nal_types else "",
     "slice_has_start_code": sc if dat else True,
   }
 
@@ -126,8 +135,8 @@ class LiveStreamVideoStreamTrack(TiciVideoStreamTrack):
     self._pts = 0
     self._t0_ns = time.monotonic_ns()
     self.timing_sei_enabled = False
-    # WebRTC peer decoders need SPS/PPS (EncodeData.header is only set on keyframes in encoder.cc).
-    # If we start on a P-frame, nothing decodes until the next IDR — skip until the first keyframe.
+    # Skip until the first IDR (NAL type 5) or KEYFRAME flag — P-slices with SPS/PPS still need a
+    # reference picture the peer does not have on a fresh WebRTC session.
     self._need_keyframe = True
 
   def switch_camera(self, camera_type: str):
@@ -154,7 +163,7 @@ class LiveStreamVideoStreamTrack(TiciVideoStreamTrack):
         continue
 
       if self._need_keyframe:
-        if not _livestream_frame_is_decoder_sync_point(idx.flags, hdr, raw_au):
+        if not _livestream_is_keyframe_or_idr_au(idx.flags, raw_au):
           continue
         self._need_keyframe = False
 

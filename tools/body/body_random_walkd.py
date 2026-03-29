@@ -271,10 +271,9 @@ def _log_livestream_pipeline_diagnosis(cameras: list[str], params: Params) -> No
     )
     cloudlog.warning(
       "body_random_walkd: pipeline: first frame which=%s encodeType=%s flags=0x%x keyframe_bit=%s "
-      "header=%dB data=%dB slice_has_start_code=%s track_sync_ok=%s — if header=0 and track_sync_ok=False "
-      "on P-frames, stream_encoderd may not be publishing SPS/PPS (see encoder.cc + "
-      "repeat_codec_header for livestream). If slice_has_start_code=False with header, V4L often omits "
-      "SC before slice; video.py prepends 0x00000001 for WebRTC.",
+      "header=%dB data=%dB slice_has_start_code=%s sync_ok=%s has_codec_header=%s nal_types=%s — "
+      "sync_ok means IDR (NAL 5) or keyframe flag (what webrtcd emits first). P-frames + SPS/PPS only "
+      "do not decode on a fresh peer. If header=0, fix stream_encoderd / repeat_codec_header.",
       diag["which"],
       diag["encode_type"],
       diag["flags"],
@@ -283,6 +282,8 @@ def _log_livestream_pipeline_diagnosis(cameras: list[str], params: Params) -> No
       diag["data_bytes"],
       diag["slice_has_start_code"],
       diag["sync_ok"],
+      diag["has_codec_header"],
+      diag.get("nal_types_sample", ""),
     )
     if _DEBUG or _PIPELINE_BURST:
       _log_livestream_sync_burst_scan(sock, service)
