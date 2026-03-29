@@ -14,7 +14,6 @@ backend; here the script POSTs SDP directly with your API key).
 
 Requires:
   - ``OPENAI_API_KEY``
-  - For ``--screen-vision``: ``GEMINI_API_KEY`` or ``GOOGLE_API_KEY``
   - micd publishing ``rawAudioData``
   - soundd consuming ``bodyRealtimeAudioData`` (no audio if soundd is not running)
   - Network access to api.openai.com
@@ -68,14 +67,6 @@ A **rapid-response detector** extends the cooldown if 4+ responses complete with
 (``speech_started`` / ``speech_stopped`` / ``committed``, etc.). Add ``--input-transcription`` to
 enable ASR on committed user audio and log ``[user speech transcript]`` lines (separate billing).
 
-**Body camera + Gemini vision** (``--screen-vision``): registers Realtime function
-``describe_visible_screen``. When speech triggers a tool call, the client waits for
-``response.done``, grabs one decoded frame from the body **livestream** camera (same H.264 feed as
-webrtcd: ``livestreamDriverEncodeData`` / ``livestreamWideRoadEncodeData`` from encoderd), encodes
-PNG, POSTs to the Gemini multimodal API (``GEMINI_API_KEY`` or ``GOOGLE_API_KEY``), sends
-``conversation.item.create`` with ``function_call_output``, then ``response.create`` for the spoken
-reply. Optional ``--screenshot-path`` / ``--screenshot-cmd`` override the camera for desktop testing.
-
 By default, the model **greets first** (``--greet``): a ``response.create`` is sent on connect so the
 user doesn't need to speak first. Use ``--no-greet`` to disable.
 
@@ -89,13 +80,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import base64
 import json
 import logging
 import os
-import shlex
 import signal
-import subprocess
 import sys
 import threading
 import time
@@ -115,15 +103,11 @@ from openpilot.system.webrtc.device.audio import (
   BodySpeaker,
   SPEAKER_SAMPLE_RATE,
 )
-from openpilot.system.webrtc.device.video import grab_livestream_png_bytes
 
 REALTIME_CALLS_URL = "https://api.openai.com/v1/realtime/calls"
 ICE_GATHER_TIMEOUT_S = 30.0
 LOG = logging.getLogger("openai_realtime_webrtc")
 MIC_LOG_INTERVAL = 50
-
-# Realtime tool: capture screen → Gemini vision → function_call_output → response.create (audio).
-SCREENSHOT_TOOL_NAME = "describe_visible_screen"
 
 _USER_SPEECH_LOG_TYPES = frozenset({
   "input_audio_buffer.speech_started",
@@ -535,86 +519,6 @@ def _turn_detection_payload(
   }
 
 
-def _vision_tool_definitions() -> list[dict[str, Any]]:
-  return [
-    {
-      "type": "function",
-      "name": SCREENSHOT_TOOL_NAME,
-      "description": (
-        "Capture a still from the body livestream camera (road or wide road view), analyze it with "
-        "a vision model, and return a text description. Call when the user asks what you see, what is "
-        "ahead, or to describe the scene."
-      ),
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "focus": {
-            "type": "string",
-            "description": "Optional: what to emphasize (e.g. error text, map, speed).",
-          },
-        },
-        "additionalProperties": False,
-      },
-    }
-  ]
-
-
-def _load_vision_png(
-  *,
-  path: str | None,
-  cmd: str | None,
-  body_camera: str,
-  camera_timeout_s: float,
-) -> bytes:
-  if path:
-    with open(path, "rb") as f:
-      return f.read()
-  if cmd:
-    argv = shlex.split(cmd, posix=os.name != "nt")
-    r = subprocess.run(argv, capture_output=True, timeout=45, check=False)
-    if r.returncode != 0:
-      err = (r.stderr or b"").decode("utf-8", errors="replace")[:800]
-      raise RuntimeError(f"vision command failed (exit {r.returncode}): {err}")
-    if not r.stdout:
-      raise RuntimeError("vision command produced no stdout")
-    return r.stdout
-  return grab_livestream_png_bytes(body_camera, timeout_s=camera_timeout_s)
-
-
-def _gemini_describe_png(api_key: str, model: str, png_bytes: bytes, instruction: str) -> str:
-  url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-  body: dict[str, Any] = {
-    "contents": [
-      {
-        "parts": [
-          {
-            "inline_data": {
-              "mime_type": "image/png",
-              "data": base64.standard_b64encode(png_bytes).decode("ascii"),
-            },
-          },
-          {"text": instruction},
-        ],
-      },
-    ],
-  }
-  r = requests.post(url, params={"key": api_key}, json=body, timeout=120)
-  if not r.ok:
-    raise RuntimeError(f"Gemini HTTP {r.status_code}: {r.text[:2000]}")
-  data = r.json()
-  cands = data.get("candidates") or []
-  if not cands:
-    raise RuntimeError(f"Gemini: no candidates in {data!r}")
-  parts = (cands[0].get("content") or {}).get("parts") or []
-  texts: list[str] = []
-  for p in parts:
-    if isinstance(p, dict) and p.get("text"):
-      texts.append(str(p["text"]))
-  if not texts:
-    raise RuntimeError(f"Gemini: no text in response {data!r}")
-  return "\n".join(texts).strip()
-
-
 async def run_session(
   *,
   api_key: str,
@@ -643,13 +547,6 @@ async def run_session(
   log_user_speech: bool,
   input_transcription: bool,
   input_transcription_model: str,
-  screen_vision: bool,
-  gemini_api_key: str | None,
-  gemini_model: str,
-  screenshot_path: str | None,
-  screenshot_cmd: str | None,
-  vision_body_camera: str,
-  vision_camera_timeout_s: float,
   greet: bool,
 ) -> None:
   loop = asyncio.get_running_loop()
@@ -706,22 +603,6 @@ async def run_session(
   }
   if instructions:
     session["instructions"] = instructions
-  if screen_vision and gemini_api_key:
-    session["tools"] = _vision_tool_definitions()
-    vis_hint = (
-      " When the user asks what you see, what is ahead, or to describe the scene, call "
-      f"{SCREENSHOT_TOOL_NAME}; then summarize the returned description briefly in speech."
-    )
-    session["instructions"] = (session.get("instructions") or "") + vis_hint
-    LOG.info(
-      "screen vision: tool=%s gemini_model=%s camera=%s timeout=%.1fs path=%s cmd=%s",
-      SCREENSHOT_TOOL_NAME,
-      gemini_model,
-      vision_body_camera,
-      vision_camera_timeout_s,
-      screenshot_path or "(livestream)",
-      screenshot_cmd or "(livestream)",
-    )
 
   LOG.info("session: model=%s voice=%s", model, voice)
   if gate is not None:
@@ -793,83 +674,6 @@ async def run_session(
   _LOOP_THRESHOLD = 3
   _LOOP_COOLDOWN_S = 6.0
 
-  responses_done_ids: set[str] = set()
-  response_done_waiters: dict[str, asyncio.Event] = {}
-  vision_suppress_commits = [0]
-
-  def _mark_response_done_for_vision(rid: str | None) -> None:
-    if not screen_vision or not rid:
-      return
-    responses_done_ids.add(rid)
-    e = response_done_waiters.pop(rid, None)
-    if e is not None:
-      e.set()
-
-  async def _wait_response_done_for_vision(rid: str) -> None:
-    if not rid or rid in responses_done_ids:
-      return
-    e = asyncio.Event()
-    response_done_waiters[rid] = e
-    try:
-      await asyncio.wait_for(e.wait(), 120.0)
-    finally:
-      response_done_waiters.pop(rid, None)
-
-  async def _execute_screen_vision_tool(call_id: str, response_id: str, arguments_str: str) -> None:
-    vision_suppress_commits[0] += 1
-    try:
-      await _wait_response_done_for_vision(response_id)
-      focus = ""
-      try:
-        args = json.loads(arguments_str) if arguments_str else {}
-        if isinstance(args, dict):
-          focus = str(args.get("focus") or "").strip()
-      except json.JSONDecodeError:
-        pass
-      instruction = (
-        "Describe this image clearly and concisely for a voice assistant to read aloud to the user."
-      )
-      if focus:
-        instruction += f" Emphasize: {focus}."
-      try:
-        png = await asyncio.to_thread(
-          _load_vision_png,
-          path=screenshot_path,
-          cmd=screenshot_cmd,
-          body_camera=vision_body_camera,
-          camera_timeout_s=vision_camera_timeout_s,
-        )
-        assert gemini_api_key is not None
-        desc = await asyncio.to_thread(
-          _gemini_describe_png, gemini_api_key, gemini_model, png, instruction
-        )
-        out = json.dumps({"ok": True, "description": desc})
-      except Exception as exc:
-        LOG.exception("screen vision tool failed")
-        out = json.dumps({"ok": False, "description": "", "error": str(exc)})
-      if dc.readyState != "open":
-        LOG.warning("data channel closed before function_call_output")
-        return
-      try:
-        dc.send(
-          json.dumps(
-            {
-              "type": "conversation.item.create",
-              "item": {
-                "type": "function_call_output",
-                "call_id": call_id,
-                "output": out,
-              },
-            }
-          )
-        )
-      except Exception:
-        LOG.exception("conversation.item.create (function_call_output) send failed")
-        return
-      _send_response_create()
-    finally:
-      vision_suppress_commits[0] -= 1
-
   def _send_response_create() -> None:
     nonlocal response_busy
     if dc.readyState != "open":
@@ -920,10 +724,6 @@ async def run_session(
     nonlocal response_busy
     if server_auto_response:
       return
-    if vision_suppress_commits[0] > 0:
-      _reject_committed_item(item_id, "vision tool active")
-      LOG.debug("input_audio_buffer.committed during screen vision tool; skip response.create")
-      return
     if gate is not None and gate.commit_blocked():
       _reject_committed_item(item_id, "half-duplex gate")
       LOG.debug("half-duplex gate or post-unmute grace; not scheduling response.create")
@@ -964,23 +764,6 @@ async def run_session(
       return
     dc_messages += 1
     typ = ev.get("type", "")
-    if (
-      screen_vision
-      and gemini_api_key
-      and typ == "response.function_call_arguments.done"
-      and ev.get("name") == SCREENSHOT_TOOL_NAME
-    ):
-      call_id = ev.get("call_id")
-      response_id = ev.get("response_id") or ""
-      if call_id:
-        loop.create_task(
-          _execute_screen_vision_tool(call_id, response_id, ev.get("arguments") or "")
-        )
-        LOG.info(
-          "screen vision: scheduled tool call_id=%s response_id=%s",
-          call_id,
-          response_id or "(none)",
-        )
     if log_user_speech and typ in _USER_SPEECH_LOG_TYPES:
       print(f"[user speech] {_format_user_speech_log_line(ev)}", file=sys.stderr, flush=True)
     if input_transcription:
@@ -996,9 +779,6 @@ async def run_session(
     if typ == "input_audio_buffer.committed" and not server_auto_response:
       _on_input_committed(item_id=ev.get("item_id"))
     elif typ == "response.done":
-      resp_obj = ev.get("response")
-      if isinstance(resp_obj, dict):
-        _mark_response_done_for_vision(resp_obj.get("id"))
       now_sync = time.monotonic()
       if gate is not None:
         gate.on_response_done()
@@ -1222,6 +1002,21 @@ async def run_session(
       soundd_watcher.stop()
 
 
+def _get_openai_api_key(params: Params) -> str:
+  """Return OpenAI API key from env var or Params (``OpenAIApiKey``), empty string if unavailable."""
+  key = os.environ.get("OPENAI_API_KEY", "").strip()
+  if key:
+    return key
+  raw = params.get("OpenAIApiKey")
+  if raw:
+    return raw.decode("utf-8", errors="replace").strip() if isinstance(raw, bytes) else str(raw).strip()
+  return ""
+
+
+_API_KEY_POLL_S = 5.0
+_SESSION_RETRY_S = 3.0
+
+
 def main() -> None:
   parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument("--model", default="gpt-realtime", help="Realtime model name")
@@ -1367,42 +1162,6 @@ def main() -> None:
     help="Transcription model when --input-transcription is set",
   )
   parser.add_argument(
-    "--screen-vision",
-    action="store_true",
-    help="Register describe_visible_screen: body camera frame → Gemini → function_call_output → response.create",
-  )
-  parser.add_argument(
-    "--vision-camera",
-    choices=("driver", "wideRoad"),
-    default=None,
-    help="Livestream source for vision (default: Params LivestreamCamera, else driver)",
-  )
-  parser.add_argument(
-    "--vision-timeout",
-    type=float,
-    default=15.0,
-    metavar="SEC",
-    help="Max seconds to wait for a decodable livestream frame when using the body camera",
-  )
-  parser.add_argument(
-    "--gemini-model",
-    default="gemini-2.0-flash",
-    metavar="MODEL",
-    help="Gemini model id for screen vision (e.g. gemini-2.0-flash, gemini-2.0-flash-exp)",
-  )
-  parser.add_argument(
-    "--screenshot-path",
-    default=None,
-    metavar="PATH",
-    help="Read PNG from this file instead of the livestream camera (desktop testing)",
-  )
-  parser.add_argument(
-    "--screenshot-cmd",
-    default=None,
-    metavar="CMD",
-    help="Shell command that writes PNG bytes to stdout; overrides livestream (parsed with shlex)",
-  )
-  parser.add_argument(
     "--playback-gain",
     type=float,
     default=1.75,
@@ -1441,9 +1200,6 @@ def main() -> None:
   if args.commit_grace_after_unmute < 0:
     print("--commit-grace-after-unmute must be >= 0", file=sys.stderr)
     sys.exit(1)
-  if args.vision_timeout <= 0:
-    print("--vision-timeout must be > 0", file=sys.stderr)
-    sys.exit(1)
 
   if args.debug:
     log_level = logging.DEBUG
@@ -1456,74 +1212,82 @@ def main() -> None:
   if args.debug:
     logging.getLogger("aiortc").setLevel(logging.INFO)
 
-  api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-  if not api_key:
-    print("Set OPENAI_API_KEY.", file=sys.stderr)
-    sys.exit(1)
+  stop = False
 
-  gemini_key: str | None = None
-  if args.screen_vision:
-    gemini_key = (
-      os.environ.get("GEMINI_API_KEY", "").strip() or os.environ.get("GOOGLE_API_KEY", "").strip()
-    )
-    if not gemini_key:
-      print("Set GEMINI_API_KEY or GOOGLE_API_KEY for --screen-vision.", file=sys.stderr)
-      sys.exit(1)
+  def _stop(*_a: object) -> None:
+    nonlocal stop
+    stop = True
 
-  vision_cam = args.vision_camera
-  if vision_cam is None:
-    raw_lc = Params().get("LivestreamCamera")
-    if isinstance(raw_lc, bytes):
-      raw_lc = raw_lc.decode("utf-8", errors="replace")
-    vision_cam = raw_lc if raw_lc in ("driver", "wideRoad") else "driver"
+  signal.signal(signal.SIGTERM, _stop)
+  signal.signal(signal.SIGINT, _stop)
 
-  try:
-    asyncio.run(
-      run_session(
-        api_key=api_key,
-        model=args.model,
-        voice=args.voice,
-        instructions=args.instructions,
-        verbose=args.verbose or args.debug,
-        debug=args.debug,
-        vad_mode=args.vad_mode,
-        vad_threshold=args.vad_threshold,
-        vad_silence_ms=args.vad_silence_ms,
-        vad_prefix_ms=args.vad_prefix_ms,
-        semantic_eagerness=args.semantic_eagerness,
-        interrupt_response=args.interrupt_response,
-        server_auto_response=args.server_auto_response,
-        noise_reduction=args.noise_reduction,
-        playback_gain=args.playback_gain,
-        output_speed=args.output_speed,
-        half_duplex=args.half_duplex,
-        half_duplex_unmute_below_samples=args.half_duplex_unmute_below_samples,
-        half_duplex_max_drain_wait_s=args.half_duplex_max_drain_wait,
-        speaker_tail_s=args.speaker_tail,
-        post_response_commit_cooldown_s=args.post_response_commit_cooldown,
-        micd_suppress_during_assistant=args.micd_suppress_during_assistant,
-        commit_grace_after_unmute_s=args.commit_grace_after_unmute,
-        log_user_speech=args.log_user_speech,
-        input_transcription=args.input_transcription,
-        input_transcription_model=args.input_transcription_model,
-        screen_vision=args.screen_vision,
-        gemini_api_key=gemini_key,
-        gemini_model=args.gemini_model,
-        screenshot_path=args.screenshot_path,
-        screenshot_cmd=args.screenshot_cmd,
-        vision_body_camera=vision_cam,
-        vision_camera_timeout_s=args.vision_timeout,
-        greet=args.greet,
+  params = Params()
+
+  api_key = _get_openai_api_key(params)
+  while not api_key and not stop:
+    LOG.warning("openai_realtime_webrtcd: waiting for OpenAI API key (set OPENAI_API_KEY or Param OpenAIApiKey)")
+    for _ in range(int(_API_KEY_POLL_S * 10)):
+      if stop:
+        return
+      time.sleep(0.1)
+    api_key = _get_openai_api_key(params)
+
+  if stop:
+    return
+
+  while not stop:
+    try:
+      asyncio.run(
+        run_session(
+          api_key=api_key,
+          model=args.model,
+          voice=args.voice,
+          instructions=args.instructions,
+          verbose=args.verbose or args.debug,
+          debug=args.debug,
+          vad_mode=args.vad_mode,
+          vad_threshold=args.vad_threshold,
+          vad_silence_ms=args.vad_silence_ms,
+          vad_prefix_ms=args.vad_prefix_ms,
+          semantic_eagerness=args.semantic_eagerness,
+          interrupt_response=args.interrupt_response,
+          server_auto_response=args.server_auto_response,
+          noise_reduction=args.noise_reduction,
+          playback_gain=args.playback_gain,
+          output_speed=args.output_speed,
+          half_duplex=args.half_duplex,
+          half_duplex_unmute_below_samples=args.half_duplex_unmute_below_samples,
+          half_duplex_max_drain_wait_s=args.half_duplex_max_drain_wait,
+          speaker_tail_s=args.speaker_tail,
+          post_response_commit_cooldown_s=args.post_response_commit_cooldown,
+          micd_suppress_during_assistant=args.micd_suppress_during_assistant,
+          commit_grace_after_unmute_s=args.commit_grace_after_unmute,
+          log_user_speech=args.log_user_speech,
+          input_transcription=args.input_transcription,
+          input_transcription_model=args.input_transcription_model,
+          greet=args.greet,
+        )
       )
-    )
-  except KeyboardInterrupt:
-    pass
-  except TimeoutError as e:
-    print(f"Timed out: {e}", file=sys.stderr)
-    sys.exit(1)
-  except Exception as e:
-    print(e, file=sys.stderr)
-    sys.exit(1)
+      break
+    except KeyboardInterrupt:
+      break
+    except Exception:
+      if stop:
+        break
+      LOG.exception("openai_realtime_webrtcd: session error; reconnecting in %.1fs", _SESSION_RETRY_S)
+      for _ in range(int(_SESSION_RETRY_S * 10)):
+        if stop:
+          return
+        time.sleep(0.1)
+      api_key = _get_openai_api_key(params)
+      if not api_key:
+        LOG.warning("openai_realtime_webrtcd: API key removed; waiting for key")
+        while not api_key and not stop:
+          for _ in range(int(_API_KEY_POLL_S * 10)):
+            if stop:
+              return
+            time.sleep(0.1)
+          api_key = _get_openai_api_key(params)
 
 
 if __name__ == "__main__":

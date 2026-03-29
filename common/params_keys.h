@@ -109,6 +109,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"Offroad_UpdateFailed", {CLEAR_ON_MANAGER_START, JSON}},
     {"Offroad_DriverMonitoringUncertain", {CLEAR_ON_MANAGER_START | CLEAR_ON_ONROAD_TRANSITION, JSON}},
     {"OnroadCycleRequested", {CLEAR_ON_MANAGER_START, BOOL}},
+    {"OpenAIApiKey", {PERSISTENT | DONT_LOG, STRING}},
     {"OpenpilotEnabledToggle", {PERSISTENT, BOOL, "1"}},
     {"PandaHeartbeatLost", {CLEAR_ON_MANAGER_START | CLEAR_ON_OFFROAD_TRANSITION, BOOL}},
     {"PandaSomResetTriggered", {CLEAR_ON_MANAGER_START | CLEAR_ON_OFFROAD_TRANSITION, BOOL}},

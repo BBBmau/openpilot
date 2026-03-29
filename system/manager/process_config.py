@@ -147,6 +147,7 @@ procs = [
   NativeProcess("bridge", "cereal/messaging", ["./bridge"], comma_body_stack_should_run),
   PythonProcess("webrtcd", "system.webrtc.webrtcd", comma_body_stack_should_run),
   PythonProcess("bodyrandomwalkd", "tools.body.body_random_walkd", comma_body_stack_should_run),
+  PythonProcess("openai_realtime_webrtcd", "tools.body.openai_realtime_webrtc", comma_body_stack_should_run),
   PythonProcess("joystick", "tools.joystick.joystick_control", and_(joystick, iscar)),
 ]
 
