@@ -26,6 +26,12 @@ from openpilot.common.params import Params
 from openpilot.common.realtime import config_realtime_process
 from openpilot.common.swaglog import cloudlog
 
+
+def _log(msg: str):
+  """Print to terminal AND cloudlog so scores are visible in standalone mode."""
+  print(msg, flush=True)
+  cloudlog.warning(msg)
+
 SAMPLE_RATE = 16_000
 OWW_CHUNK_SAMPLES = 1280  # 80 ms at 16 kHz — openWakeWord standard frame
 MEL_FRAMES_PER_EMBEDDING = 76
@@ -131,7 +137,7 @@ def main():
     cloudlog.exception("bodywaked: failed to load ONNX models")
     return
 
-  cloudlog.info("bodywaked: detector ready, listening for wake word")
+  _log("bodywaked: detector ready, listening for wake word (waiting for rawAudioData from micd...)")
 
   sm = messaging.SubMaster(["rawAudioData"])
   pcm_buf = np.empty(0, dtype=np.int16)
@@ -181,22 +187,22 @@ def main():
 
       if prob >= SCORE_LOG_FLOOR:
         max_score_above_floor = max(max_score_above_floor, prob)
-        cloudlog.info(f"bodywaked: score={prob:.4f} threshold={threshold:.2f} inference#{inference_count}")
+        _log(f"bodywaked: score={prob:.4f} threshold={threshold:.2f} inference#{inference_count}")
 
       now = time.monotonic()
       if prob >= threshold and now - last_fire >= COOLDOWN_S:
         detections += 1
-        cloudlog.event("bodywaked: WAKE WORD DETECTED", score=prob, threshold=threshold,
-                       detection_num=detections, inference_num=inference_count)
+        _log(f"bodywaked: WAKE WORD DETECTED | score={prob:.4f} threshold={threshold:.2f} "
+             f"detection#{detections} inference#{inference_count}")
         params.put_bool("BodyWakeIgnition", True)
         last_fire = now
         detector.reset()
 
       # periodic summary for analysis even during silence
       if now - last_summary >= SUMMARY_INTERVAL_S:
-        cloudlog.info(f"bodywaked: summary | inferences={inference_count} detections={detections} "
-                      f"max_score={max_score:.4f} max_notable={max_score_above_floor:.4f} "
-                      f"threshold={threshold:.2f}")
+        _log(f"bodywaked: summary | inferences={inference_count} detections={detections} "
+             f"max_score={max_score:.4f} max_notable={max_score_above_floor:.4f} "
+             f"threshold={threshold:.2f}")
         max_score = 0.0
         max_score_above_floor = 0.0
         last_summary = now
