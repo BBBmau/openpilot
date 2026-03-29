@@ -52,7 +52,9 @@ class LiveStreamVideoStreamTrack(TiciVideoStreamTrack):
     super().__init__(camera_type, dt)
 
     self._camera_type = camera_type
-    self._sock = messaging.sub_sock(self.camera_to_sock_mapping[camera_type], conflate=True)
+    # Do not conflate: latest-only often lands on a P-frame with empty ``header`` (SPS/PPS only on
+    # keyframes in encoder.cc). Remote WebRTC decoders then never emit a frame until a keyframe.
+    self._sock = messaging.sub_sock(self.camera_to_sock_mapping[camera_type], conflate=False)
     self._pts = 0
     self._t0_ns = time.monotonic_ns()
     self.timing_sei_enabled = False
@@ -61,7 +63,7 @@ class LiveStreamVideoStreamTrack(TiciVideoStreamTrack):
     if camera_type not in self.camera_to_sock_mapping or camera_type == self._camera_type:
       return
     self._camera_type = camera_type
-    self._sock = messaging.sub_sock(self.camera_to_sock_mapping[camera_type], conflate=True)
+    self._sock = messaging.sub_sock(self.camera_to_sock_mapping[camera_type], conflate=False)
 
   async def recv(self):
     while True:

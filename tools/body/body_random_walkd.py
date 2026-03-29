@@ -204,12 +204,14 @@ def _log_livestream_pipeline_diagnosis(cameras: list[str], params: Params) -> No
       break
 
   started = bool(sm["deviceState"].started) if sm.seen["deviceState"] else None
-  not_car = bool(sm["carParams"].notCar) if sm.seen["carParams"] else None
+  not_car_s = (
+    str(bool(sm["carParams"].notCar)) if sm.seen["carParams"] else "(no carParams message yet)"
+  )
   cloudlog.warning(
     "body_random_walkd: pipeline snapshot: deviceState.started=%s carParams.notCar=%s "
     "LiveIgnition=%s IsDriverViewEnabled=%s LivestreamCamera=%r bodyjim_cameras=%r",
     started,
-    not_car,
+    not_car_s,
     params.get_bool("LiveIgnition"),
     params.get_bool("IsDriverViewEnabled"),
     params.get("LivestreamCamera") or "driver",
@@ -231,7 +233,9 @@ def _log_livestream_pipeline_diagnosis(cameras: list[str], params: Params) -> No
   if got:
     cloudlog.warning(
       "body_random_walkd: pipeline: got %s on %s within %.1fs (logMonoTime=%s) — "
-      "H.264 is reaching msgq; stall is likely WebRTC offer/answer, decode, or bodyjim recv path",
+      "msgq is fine; if BodyEnv.reset still times out, webrtcd was likely feeding the peer with "
+      "conflated P-frames (empty EncodeData header until keyframe). Use LiveStreamVideoStreamTrack "
+      "with conflate=False (system/webrtc/device/video.py). Otherwise check ICE/SDP or bodyjim decode.",
       got,
       service,
       probe_s,
