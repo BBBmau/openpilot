@@ -232,7 +232,7 @@ class Soundd:
     with self.get_stream(sd) as stream:
       # Faster than 20 Hz so we pull msgq → deque closer to real time; callback still drains at a
       # fixed ~blocksize / SAMPLE_RATE, but feeding was ~50 ms apart and conflate hid dropped frames.
-      rk = Ratekeeper(100)
+      rk = Ratekeeper(100, print_delay_threshold=None)
 
       cloudlog.info(f"soundd stream started: {stream.samplerate=} {stream.channels=} {stream.dtype=} {stream.device=}, {stream.blocksize=}")
       while True:

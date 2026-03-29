@@ -1,36 +1,43 @@
 #!/usr/bin/env python3
 """
-Wake-word listener for comma body: sets BodyVoiceAssistantActive when the phrase is heard.
+Wake-word listener for comma body.
 
-Requires the ``openwakeword`` Python package on the device. Enable with param ``BodyWakeWordEnabled``
-after installing (see pyproject / ``uv sync`` on dev). If the import fails, bodywaked exits cleanly
-so manager does not spin on ``ModuleNotFoundError``.
+Detects "hey body" (or a test wake phrase) from rawAudioData and sets
+BodyWakeIgnition to bring the body onroad — starting the voice assistant,
+walk cycle, and full body stack.
 
-For a true "hey comma" detector, train an openWakeWord ONNX model and set param BodyWakeWordModel
-to its absolute path. If unset, a built-in model (hey_jarvis) is used only to validate the pipeline;
-it will not respond to "hey comma".
+Uses a 3-stage openWakeWord ONNX pipeline (melspectrogram → embedding →
+wake-word classifier) running on onnxruntime, with no openwakeword dependency.
+
+Enable with param BodyWakeWordEnabled. To use a custom wake-word ONNX model,
+set BodyWakeWordModel to its path; otherwise the bundled hey_jarvis model is
+used for pipeline testing.
 """
 from __future__ import annotations
 
-import sys
 import time
 from pathlib import Path
 
 import numpy as np
+import onnxruntime as ort
 
 from cereal import messaging
 from openpilot.common.params import Params
 from openpilot.common.realtime import config_realtime_process
 from openpilot.common.swaglog import cloudlog
 
-# Must match system/micd.py (rawAudioData)
 SAMPLE_RATE = 16_000
+OWW_CHUNK_SAMPLES = 1280  # 80 ms at 16 kHz — openWakeWord standard frame
+MEL_FRAMES_PER_EMBEDDING = 76
+EMBEDDINGS_PER_PREDICTION = 16
 
-# openWakeWord expects 80 ms frames at 16 kHz
-_OWW_FRAME_SAMPLES = 1280
-_COOLDOWN_S = 4.0
-# Require several consecutive frames above threshold (model name -> frames)
-_OWW_PATIENCE_FRAMES = 3
+COOLDOWN_S = 4.0
+DEFAULT_THRESHOLD = 0.5
+
+MODEL_DIR = Path(__file__).parent / "models"
+MELSPEC_MODEL = MODEL_DIR / "melspectrogram.onnx"
+EMBEDDING_MODEL = MODEL_DIR / "embedding_model.onnx"
+DEFAULT_WW_MODEL = MODEL_DIR / "hey_jarvis_v0.1.onnx"
 
 
 def _param_str(params: Params, key: str) -> str:
@@ -42,53 +49,87 @@ def _param_str(params: Params, key: str) -> str:
   return str(raw).strip()
 
 
-def _load_model(params: Params):
-  import openwakeword
-  from openwakeword.model import Model
+class WakeWordDetector:
+  """3-stage openWakeWord ONNX pipeline: mel → embedding → classifier."""
 
-  custom = _param_str(params, "BodyWakeWordModel")
-  if custom and Path(custom).is_file():
-    paths = [custom.strip()]
-    cloudlog.event("bodywaked_custom_model", path=paths[0])
-  else:
-    if custom:
-      cloudlog.error(f"bodywaked: BodyWakeWordModel path not found: {custom!r}")
-    paths_dict = dict(zip(openwakeword.models.keys(), openwakeword.get_pretrained_model_paths(), strict=True))
-    paths = [paths_dict["hey_jarvis"]]
-    cloudlog.warning(
-      "bodywaked: using built-in hey_jarvis model for testing only; "
-      + "train a 'hey comma' openWakeWord model and set BodyWakeWordModel to that .onnx path"
-    )
-  return Model(wakeword_model_paths=paths)
+  def __init__(self, ww_model_path: str | Path):
+    opts = ort.SessionOptions()
+    opts.inter_op_num_threads = 1
+    opts.intra_op_num_threads = 1
+
+    self.mel_sess = ort.InferenceSession(str(MELSPEC_MODEL), opts)
+    self.emb_sess = ort.InferenceSession(str(EMBEDDING_MODEL), opts)
+    self.ww_sess = ort.InferenceSession(str(ww_model_path), opts)
+
+    self.mel_buffer = np.zeros((0, 32), dtype=np.float32)
+    self.emb_buffer = np.zeros((0, 96), dtype=np.float32)
+
+  def reset(self):
+    self.mel_buffer = np.zeros((0, 32), dtype=np.float32)
+    self.emb_buffer = np.zeros((0, 96), dtype=np.float32)
+
+  def process_audio(self, audio_int16: np.ndarray) -> float | None:
+    """Feed int16 audio; returns wake-word probability or None if not enough data yet."""
+    audio_f32 = audio_int16.astype(np.float32) / 32768.0
+    audio_f32 = audio_f32.reshape(1, -1)
+
+    mel_out = self.mel_sess.run(None, {"input": audio_f32})[0]
+    # mel_out shape: (1, 1, time_steps, 32) → squeeze to (time_steps, 32)
+    mel_frames = mel_out.squeeze()
+    if mel_frames.ndim == 1:
+      mel_frames = mel_frames.reshape(1, -1)
+    self.mel_buffer = np.vstack((self.mel_buffer, mel_frames))
+
+    if self.mel_buffer.shape[0] < MEL_FRAMES_PER_EMBEDDING:
+      return None
+
+    # consume oldest 76 frames for embedding
+    mel_input = self.mel_buffer[:MEL_FRAMES_PER_EMBEDDING]
+    self.mel_buffer = self.mel_buffer[MEL_FRAMES_PER_EMBEDDING:]
+
+    mel_input = mel_input.reshape(1, MEL_FRAMES_PER_EMBEDDING, 32, 1)
+    emb_out = self.emb_sess.run(None, {"input_1": mel_input})[0]
+    embedding = emb_out.reshape(1, 96)
+    self.emb_buffer = np.vstack((self.emb_buffer, embedding))
+
+    # keep only the last N embeddings
+    if self.emb_buffer.shape[0] > EMBEDDINGS_PER_PREDICTION:
+      self.emb_buffer = self.emb_buffer[-EMBEDDINGS_PER_PREDICTION:]
+
+    if self.emb_buffer.shape[0] < EMBEDDINGS_PER_PREDICTION:
+      return None
+
+    ww_input = self.emb_buffer.reshape(1, EMBEDDINGS_PER_PREDICTION, 96)
+    prob = float(self.ww_sess.run(None, {"x.1": ww_input})[0].squeeze())
+    return prob
 
 
 def main():
   config_realtime_process(0, 5)
   cloudlog.bind(daemon="bodywaked")
 
-  try:
-    import openwakeword  # noqa: F401
-  except ImportError:
-    cloudlog.error(
-      "bodywaked: openwakeword is not installed (install deps / uv sync) or keep "
-      "BodyWakeWordEnabled off until then; exiting."
-    )
-    sys.exit(0)
-
   params = Params()
-  try:
-    model = _load_model(params)
-  except Exception:
-    cloudlog.exception("bodywaked: failed to load wake models")
-    sys.exit(1)
 
-  model_names = list(model.models.keys())
-  if len(model_names) != 1:
-    cloudlog.warning(f"bodywaked: expected one wake model, got {model_names}")
-  patience_mdl = model_names[0]
+  custom = _param_str(params, "BodyWakeWordModel")
+  if custom and Path(custom).is_file():
+    ww_path = custom
+    cloudlog.event("bodywaked: using custom model", path=custom)
+  else:
+    if custom:
+      cloudlog.error(f"bodywaked: BodyWakeWordModel path not found: {custom!r}, falling back to default")
+    ww_path = str(DEFAULT_WW_MODEL)
+    cloudlog.warning("bodywaked: using hey_jarvis test model — train a 'hey body' model for production")
+
+  try:
+    detector = WakeWordDetector(ww_path)
+  except Exception:
+    cloudlog.exception("bodywaked: failed to load ONNX models")
+    return
+
+  cloudlog.info("bodywaked: detector ready, listening for wake word")
 
   sm = messaging.SubMaster(["rawAudioData"])
-  pcm = np.empty(0, dtype=np.int16)
+  pcm_buf = np.empty(0, dtype=np.int16)
   last_fire = 0.0
   warned_bad_sr = False
 
@@ -107,33 +148,28 @@ def main():
     chunk = np.frombuffer(msg.data, dtype=np.int16)
     if chunk.size == 0:
       continue
+    pcm_buf = np.concatenate((pcm_buf, chunk))
 
-    pcm = np.concatenate((pcm, chunk))
-
-    thresh_s = _param_str(params, "BodyWakeWordThreshold") or "0.35"
+    thresh_s = _param_str(params, "BodyWakeWordThreshold") or str(DEFAULT_THRESHOLD)
     try:
       threshold = float(thresh_s)
     except ValueError:
-      threshold = 0.35
+      threshold = DEFAULT_THRESHOLD
 
-    while pcm.size >= _OWW_FRAME_SAMPLES:
-      frame = pcm[:_OWW_FRAME_SAMPLES]
-      pcm = pcm[_OWW_FRAME_SAMPLES:]
+    while pcm_buf.size >= OWW_CHUNK_SAMPLES:
+      frame = pcm_buf[:OWW_CHUNK_SAMPLES]
+      pcm_buf = pcm_buf[OWW_CHUNK_SAMPLES:]
 
-      preds = model.predict(
-        frame,
-        patience={patience_mdl: _OWW_PATIENCE_FRAMES},
-        threshold={patience_mdl: threshold},
-      )
-      score = max(float(v) for v in preds.values()) if preds else 0.0
-      now = time.monotonic()
-      if score < threshold or now - last_fire < _COOLDOWN_S:
+      prob = detector.process_audio(frame)
+      if prob is None:
         continue
 
-      params.put_bool("BodyVoiceAssistantActive", True)
-      cloudlog.event("body_wake_word_trigger", score=score, model=patience_mdl)
-      last_fire = now
-      model.reset()
+      now = time.monotonic()
+      if prob >= threshold and now - last_fire >= COOLDOWN_S:
+        cloudlog.event("bodywaked: wake word detected!", score=prob)
+        params.put_bool("BodyWakeIgnition", True)
+        last_fire = now
+        detector.reset()
 
 
 if __name__ == "__main__":

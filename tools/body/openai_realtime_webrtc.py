@@ -981,6 +981,7 @@ async def run_session(
     p_cleanup.put_bool_nonblocking("MicdSuppressRawAudio", False)
     p_cleanup.put_bool_nonblocking("BodyVoiceAssistantListening", False)
     p_cleanup.put_bool_nonblocking("BodyVoiceAssistantActive", False)
+    p_cleanup.put_bool_nonblocking("BodyWakeIgnition", False)
     for sig in (signal.SIGINT, signal.SIGTERM):
       try:
         loop.remove_signal_handler(sig)
