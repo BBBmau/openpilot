@@ -41,6 +41,10 @@ def driverview(started: bool, params: Params, CP: car.CarParams) -> bool:
 def notcar(started: bool, params: Params, CP: car.CarParams) -> bool:
   return started and CP.notCar
 
+def notcar_no_body_stack(started: bool, params: Params, CP: car.CarParams) -> bool:
+  """Body joystick control — only when the WebRTC stack is NOT handling it."""
+  return started and CP.notCar and not comma_body_stack_should_run(started, params, CP)
+
 def iscar(started: bool, params: Params, CP: car.CarParams) -> bool:
   return started and not CP.notCar
 
@@ -149,7 +153,7 @@ procs = [
   PythonProcess("calibrationd", "selfdrive.locationd.calibrationd", only_onroad),
   PythonProcess("torqued", "selfdrive.locationd.torqued", only_onroad),
   PythonProcess("controlsd", "selfdrive.controls.controlsd", and_(not_joystick, iscar)),
-  PythonProcess("joystickd", "tools.joystick.joystickd", or_(joystick, notcar)),
+  PythonProcess("joystickd", "tools.joystick.joystickd", or_(joystick, notcar_no_body_stack)),
   PythonProcess("selfdrived", "selfdrive.selfdrived.selfdrived", only_onroad),
   PythonProcess("card", "selfdrive.car.card", only_onroad),
   PythonProcess("deleter", "system.loggerd.deleter", always_run),

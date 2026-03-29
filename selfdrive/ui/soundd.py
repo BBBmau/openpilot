@@ -61,11 +61,6 @@ def check_selfdrive_timeout_alert(sm):
   ss_missing = time.monotonic() - sm.recv_time['selfdriveState']
 
   if ss_missing > SELFDRIVE_STATE_TIMEOUT:
-    # Don't alarm when the device is offroad — selfdrived is intentionally stopped.
-    # On body, soundd stays running offroad; without this gate the timeout fires
-    # every ignition-off cycle and blares warningImmediate for ~10 s.
-    if sm.valid.get('deviceState') and not sm['deviceState'].started:
-      return False
     if sm['selfdriveState'].enabled and (ss_missing - SELFDRIVE_STATE_TIMEOUT) < 10:
       return True
 
@@ -200,6 +195,20 @@ class Soundd:
         self.feed_webrtc_pcm(pcm, int(br.sampleRate), source="body")
 
   def get_audible_alert(self, sm):
+    # When offroad, suppress selfdrived warnings — they are shutdown artifacts.
+    # On body, soundd stays running offroad so these would otherwise blare.
+    offroad = sm.valid['deviceState'] and not sm['deviceState'].started
+    if offroad:
+      if self.current_alert in (AudibleAlert.warningSoft, AudibleAlert.warningImmediate):
+        self.update_alert(AudibleAlert.none)
+      self.selfdrive_timeout_alert = False
+      # Still allow soundRequest (WebRTC/body audio cues) while offroad
+      if sm.updated['soundRequest']:
+        new_alert = sm['soundRequest'].sound.raw
+        if new_alert != AudibleAlert.none:
+          self.update_alert(new_alert)
+      return
+
     if sm.updated['soundRequest']:
       new_alert = sm['soundRequest'].sound.raw
       if new_alert != AudibleAlert.none:
