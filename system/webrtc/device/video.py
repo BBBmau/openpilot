@@ -48,6 +48,20 @@ def _livestream_frame_is_decoder_sync_point(idx_flags: int, header: bytes, frame
   return _h264_annex_b_has_sps_pps_or_idr(frame_data)
 
 
+def _ensure_annex_b_start_before_slice(data: bytes) -> bytes:
+  """
+  ``V4L2_MPEG_VIDEO_HEADER_MODE_SEPARATE`` (v4l_encoder.cc) stores SPS/PPS in ``EncodeData.header``
+  with start codes; the slice often lives in ``data`` *without* a leading ``0x000001``. Raw
+  concatenation glues the slice into the previous NAL's RBSP, aiortc's H264 packer mis-splits, and
+  the remote decoder never outputs a frame.
+  """
+  if not data:
+    return data
+  if data.startswith(b"\x00\x00\x01") or data.startswith(b"\x00\x00\x00\x01"):
+    return data
+  return b"\x00\x00\x00\x01" + data
+
+
 def livestream_encode_data_diag(msg: Any) -> dict[str, bool | int | str]:
   """Compact fields for logging / tools (e.g. body_random_walkd when WebRTC reset times out)."""
   which = msg.which()
@@ -56,6 +70,7 @@ def livestream_encode_data_diag(msg: Any) -> dict[str, bool | int | str]:
   hdr = bytes(evta.header)
   dat = bytes(evta.data)
   frame = hdr + dat
+  sc = dat.startswith(b"\x00\x00\x01") or dat.startswith(b"\x00\x00\x00\x01")
   return {
     "which": which,
     "encode_type": str(idx.type),
@@ -64,6 +79,7 @@ def livestream_encode_data_diag(msg: Any) -> dict[str, bool | int | str]:
     "data_bytes": len(dat),
     "keyframe_bit": bool(idx.flags & LIVESTREAM_KEYFRAME_FLAG),
     "sync_ok": _livestream_frame_is_decoder_sync_point(idx.flags, hdr, frame),
+    "slice_has_start_code": sc if dat else True,
   }
 
 
@@ -132,22 +148,26 @@ class LiveStreamVideoStreamTrack(TiciVideoStreamTrack):
       evta = getattr(msg, msg.which())
       idx = evta.idx
       hdr = bytes(evta.header)
-      frame_data = hdr + bytes(evta.data)
-      if not frame_data:
+      dat_raw = bytes(evta.data)
+      raw_au = hdr + dat_raw
+      if not raw_au:
         continue
 
       if self._need_keyframe:
-        if not _livestream_frame_is_decoder_sync_point(idx.flags, hdr, frame_data):
+        if not _livestream_frame_is_decoder_sync_point(idx.flags, hdr, raw_au):
           continue
         self._need_keyframe = False
 
+      dat = _ensure_annex_b_start_before_slice(dat_raw)
       if self.timing_sei_enabled:
         capture_ms = (evta.idx.timestampEof - evta.idx.timestampSof) / 1e6
         encode_ms = (msg.logMonoTime - evta.idx.timestampEof) / 1e6
         send_delay_ms = (time.monotonic_ns() - msg.logMonoTime) / 1e6
         send_wall_ms = time.time() * 1000  # noqa: TID251
         sei_nal = create_timing_sei(capture_ms, encode_ms, send_delay_ms, send_wall_ms)
-        frame_data = evta.header + sei_nal + evta.data
+        frame_data = hdr + sei_nal + dat
+      else:
+        frame_data = hdr + dat
 
       packet = av.Packet(frame_data)
       packet.time_base = self._time_base
@@ -189,7 +209,7 @@ def grab_livestream_png_bytes(camera_type: str, *, timeout_s: float = 15.0) -> b
     batch = messaging.drain_sock(sock, wait_for_one=True)
     for msg in batch:
       evta = getattr(msg, msg.which())
-      raw = bytes(evta.header) + bytes(evta.data)
+      raw = bytes(evta.header) + _ensure_annex_b_start_before_slice(bytes(evta.data))
       if not raw:
         continue
       try:

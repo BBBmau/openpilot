@@ -271,14 +271,16 @@ def _log_livestream_pipeline_diagnosis(cameras: list[str], params: Params) -> No
     )
     cloudlog.warning(
       "body_random_walkd: pipeline: first frame which=%s encodeType=%s flags=0x%x keyframe_bit=%s "
-      "header=%dB data=%dB track_sync_ok=%s — if track_sync_ok is False, webrtcd may spin until an "
-      "IDR; if True but reset still fails, check WebRTC (ICE/SDP) and bodyjim H264 decode.",
+      "header=%dB data=%dB slice_has_start_code=%s track_sync_ok=%s — slice_has_start_code=False is "
+      "normal for V4L separate-header mode; LiveStreamVideoStreamTrack prepends 0x00000001 before WebRTC. "
+      "If reset still fails with sync_ok, check ICE/SDP and bodyjim decode.",
       diag["which"],
       diag["encode_type"],
       diag["flags"],
       diag["keyframe_bit"],
       diag["header_bytes"],
       diag["data_bytes"],
+      diag["slice_has_start_code"],
       diag["sync_ok"],
     )
     if _DEBUG or _PIPELINE_BURST:
