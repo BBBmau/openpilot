@@ -40,9 +40,13 @@ use **far_field** noise shaping and a **higher VAD threshold**; raise ``--vad-th
 **Half-duplex uplink** (on by default): WebRTC uplink and (with ``--micd-suppress-during-assistant``)
 ``rawAudioData`` are **fully muted** for the whole assistant ``response``. The client arms this gate
 **before** sending ``response.create`` so RTP does not carry real mic audio during API RTT (arming
-only after a successful send caused echo loops on body speakers). Server events
-(``response.created``, ``response.output_item.added`` for assistant messages,
-``output_audio_buffer.started``, etc.) still tighten timing if the model speaks before our arm.
+only after a successful send caused echo loops on body speakers). Assistant **downlink RTP** also
+calls ``ensure_response_active()`` on every decoded frame so the mic stays off if data-channel
+events lag behind audio. Server events (``response.created``, assistant ``output_item.added``,
+``output_audio_buffer.*``, ``response.output_audio.*``, ``response.audio.*``, etc.) still align timing.
+Stale mic samples in the uplink deque are **flushed** when the gate first arms.
+``MicdSuppressRawAudio`` uses a **blocking** params write on suppress 0→1 / 1→0 edges so micd picks
+it up within one 50 ms callback (the prior 10 ms nonblocking-only loop could lag).
 Mute holds from there through ``response.done`` plus the timing floor / optional soundd drain below.
 After ``response.done``, the client keeps the uplink off until an **API timing floor** (minimum hold
 after ``response.done``, ``response.output_audio_transcript.done``, and ``response.output_audio.done``)
@@ -250,6 +254,11 @@ class _ResponseHalfDuplexGate:
     self._armed_post_response_soundd = False
     self._soundd_drain_deadline: float | None = None
     self._soundd_drain_timeout_logged = False
+    self._on_uplink_arm: Callable[[], None] | None = None
+
+  def set_on_uplink_arm(self, fn: Callable[[], None] | None) -> None:
+    """Optional: e.g. flush BodyMicAudioTrack buffer when muting starts."""
+    self._on_uplink_arm = fn
 
   def _reset_post_done_drain(self) -> None:
     self._empty_since = None
@@ -334,6 +343,11 @@ class _ResponseHalfDuplexGate:
     self._transcript_done_at = None
     self._audio_done_at = None
     self._reset_post_done_drain()
+    if self._on_uplink_arm is not None:
+      try:
+        self._on_uplink_arm()
+      except Exception:
+        LOG.exception("half-duplex on_uplink_arm callback failed")
 
   def rollback_response_arm(self) -> None:
     """If ``response.create`` failed after we armed the gate, drop uplink mute."""
@@ -429,6 +443,34 @@ class _DebugMicTrack(BodyMicAudioTrack):
         frame.format.name if frame.format else "?",
       )
     return frame
+
+
+class _ArmHalfDuplexGateOnDownlinkFrame(MediaStreamTrack):
+  """Mute uplink as soon as assistant RTP arrives; data-channel events can lag behind audio."""
+
+  def __init__(self, track: MediaStreamTrack, arm: Callable[[], None]) -> None:
+    super().__init__()
+    self._track = track
+    self._arm = arm
+
+  @property
+  def kind(self) -> str:
+    return self._track.kind
+
+  async def recv(self):
+    self._arm()
+    return await self._track.recv()
+
+
+def _dc_event_triggers_output_audio_arm(typ: str) -> bool:
+  """Match current and legacy Realtime server event names for assistant audio output."""
+  if typ in ("response.output_audio_transcript.done", "response.output_audio.done"):
+    return False
+  if typ.startswith("response.output_audio.") or typ.startswith("output_audio_buffer."):
+    return True
+  if typ.startswith("response.audio."):
+    return True
+  return False
 
 
 class _DebugHalfDuplexMicTrack(_HalfDuplexMicTrack):
@@ -982,14 +1024,13 @@ async def run_session(
         item = ev.get("item")
         if isinstance(item, dict) and item.get("type") == "message" and item.get("role") == "assistant":
           gate.ensure_response_active()
-      elif typ in ("response.output_audio.delta", "output_audio_buffer.started"):
-        # WebRTC: model audio is mostly on RTP; ``response.output_audio.delta`` is often absent.
-        # ``output_audio_buffer.started`` still fires on the data channel (see Realtime server events).
-        gate.ensure_response_active()
       elif typ == "response.output_audio_transcript.done":
         gate.on_output_audio_transcript_done()
       elif typ == "response.output_audio.done":
         gate.on_output_audio_done()
+      elif _dc_event_triggers_output_audio_arm(typ):
+        # WebRTC: most audio is RTP; DC names vary by API revision — see _dc_event_triggers_output_audio_arm.
+        gate.ensure_response_active()
     if typ in ("response.output_audio_transcript.delta", "response.output_text.delta"):
       d = ev.get("delta", "")
       if d:
@@ -1027,6 +1068,9 @@ async def run_session(
   else:
     mic = BodyMicAudioTrack()
 
+  if half_duplex and gate is not None:
+    gate.set_on_uplink_arm(mic.flush_uplink_buffer)
+
   speaker = BodySpeaker(
     pcm_service=BODY_REALTIME_PCM_SERVICE,
     pcm_gain=playback_gain,
@@ -1042,6 +1086,8 @@ async def run_session(
       return
     audio_to_speaker_started = True
     LOG.info("starting BodySpeaker for remote audio downlink")
+    if half_duplex and gate is not None:
+      track = _ArmHalfDuplexGateOnDownlinkFrame(track, gate.ensure_response_active)
     speaker.start_track(track)
 
   pc.addTrack(mic)
@@ -1052,9 +1098,14 @@ async def run_session(
 
     async def _micd_suppress_loop() -> None:
       p = Params()
+      prev = gate.suppress_uplink()
+      p.put_bool("MicdSuppressRawAudio", prev)
       while not stop.is_set():
-        p.put_bool_nonblocking("MicdSuppressRawAudio", gate.suppress_uplink())
-        await asyncio.sleep(0.01)
+        cur = gate.suppress_uplink()
+        if cur != prev:
+          p.put_bool("MicdSuppressRawAudio", cur)
+          prev = cur
+        await asyncio.sleep(0.005)
 
     micd_suppress_task = asyncio.create_task(_micd_suppress_loop())
 

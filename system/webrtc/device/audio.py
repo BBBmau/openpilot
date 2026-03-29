@@ -132,6 +132,12 @@ class BodyMicAudioTrack(AudioStreamTrack):
     frame.time_base = fractions.Fraction(1, self._sample_rate)
     return frame
 
+  def flush_uplink_buffer(self) -> None:
+    """Drop queued mic PCM so half-duplex does not send pre-arm samples already in the deque."""
+    with self._lock:
+      self._buffer = PcmBuffer(dtype=np.int16)
+    self._buffer_event.set()
+
   def stop(self):
     super().stop()
     self._running = False
