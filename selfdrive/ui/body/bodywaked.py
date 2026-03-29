@@ -34,6 +34,11 @@ EMBEDDINGS_PER_PREDICTION = 16
 COOLDOWN_S = 4.0
 DEFAULT_THRESHOLD = 0.5
 
+# Scores below this are silence/noise — not worth logging
+SCORE_LOG_FLOOR = 0.05
+# How often (seconds) to emit a periodic summary even when nothing interesting happens
+SUMMARY_INTERVAL_S = 10.0
+
 MODEL_DIR = Path(__file__).parent / "models"
 MELSPEC_MODEL = MODEL_DIR / "melspectrogram.onnx"
 EMBEDDING_MODEL = MODEL_DIR / "embedding_model.onnx"
@@ -133,6 +138,13 @@ def main():
   last_fire = 0.0
   warned_bad_sr = False
 
+  # analysis / accuracy tracking
+  inference_count = 0
+  max_score = 0.0
+  max_score_above_floor = 0.0
+  detections = 0
+  last_summary = time.monotonic()
+
   while True:
     sm.update(1000)
     if not sm.updated["rawAudioData"]:
@@ -164,12 +176,30 @@ def main():
       if prob is None:
         continue
 
+      inference_count += 1
+      max_score = max(max_score, prob)
+
+      if prob >= SCORE_LOG_FLOOR:
+        max_score_above_floor = max(max_score_above_floor, prob)
+        cloudlog.info(f"bodywaked: score={prob:.4f} threshold={threshold:.2f} inference#{inference_count}")
+
       now = time.monotonic()
       if prob >= threshold and now - last_fire >= COOLDOWN_S:
-        cloudlog.event("bodywaked: wake word detected!", score=prob)
+        detections += 1
+        cloudlog.event("bodywaked: WAKE WORD DETECTED", score=prob, threshold=threshold,
+                       detection_num=detections, inference_num=inference_count)
         params.put_bool("BodyWakeIgnition", True)
         last_fire = now
         detector.reset()
+
+      # periodic summary for analysis even during silence
+      if now - last_summary >= SUMMARY_INTERVAL_S:
+        cloudlog.info(f"bodywaked: summary | inferences={inference_count} detections={detections} "
+                      f"max_score={max_score:.4f} max_notable={max_score_above_floor:.4f} "
+                      f"threshold={threshold:.2f}")
+        max_score = 0.0
+        max_score_above_floor = 0.0
+        last_summary = now
 
 
 if __name__ == "__main__":
