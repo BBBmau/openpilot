@@ -40,6 +40,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"AlphaLongitudinalEnabled", {PERSISTENT | DEVELOPMENT_ONLY, BOOL}},
     {"BodyRandomWalkHumanRender", {PERSISTENT, BOOL, "1"}},
     {"BodyVoiceAssistantActive", {CLEAR_ON_OFFROAD_TRANSITION, BOOL}},
+    {"BodyVoiceAssistantListening", {CLEAR_ON_OFFROAD_TRANSITION, BOOL}},
     {"BodyWakeWordEnabled", {PERSISTENT, BOOL}},
     {"BodyWakeWordModel", {PERSISTENT, STRING}},
     {"BodyWakeWordThreshold", {PERSISTENT, STRING, "0.35"}},
