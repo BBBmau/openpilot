@@ -58,6 +58,7 @@ class WakeWordDetector:
     self.mel_sess = ort.InferenceSession(str(MELSPEC_MODEL), opts)
     self.emb_sess = ort.InferenceSession(str(EMBEDDING_MODEL), opts)
     self.ww_sess = ort.InferenceSession(str(ww_model_path), opts)
+    self.ww_input_name = self.ww_sess.get_inputs()[0].name
     self.reset()
 
   def reset(self):
@@ -92,7 +93,7 @@ class WakeWordDetector:
       return None
 
     ww_input = self.emb_buffer.reshape(1, EMBEDDINGS_PER_PREDICTION, 96)
-    return float(self.ww_sess.run(None, {"x.1": ww_input})[0].squeeze())
+    return float(self.ww_sess.run(None, {self.ww_input_name: ww_input})[0].squeeze())
 
 
 def main():
