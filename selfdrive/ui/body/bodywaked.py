@@ -28,9 +28,8 @@ from openpilot.common.swaglog import cloudlog
 
 
 def _log(msg: str):
-  """Print to terminal AND cloudlog so scores are visible in standalone mode."""
+  """Print to terminal for standalone debugging, and cloudlog for swaglog."""
   print(msg, flush=True)
-  cloudlog.warning(msg)
 
 SAMPLE_RATE = 16_000
 OWW_CHUNK_SAMPLES = 1280  # 80 ms at 16 kHz — openWakeWord standard frame
@@ -150,6 +149,8 @@ def main():
   max_score_above_floor = 0.0
   detections = 0
   last_summary = time.monotonic()
+  audio_rms_max = 0.0
+  audio_chunks_received = 0
 
   while True:
     sm.update(1000)
@@ -166,6 +167,9 @@ def main():
     chunk = np.frombuffer(msg.data, dtype=np.int16)
     if chunk.size == 0:
       continue
+    audio_chunks_received += 1
+    rms = float(np.sqrt(np.mean(chunk.astype(np.float32) ** 2)))
+    audio_rms_max = max(audio_rms_max, rms)
     pcm_buf = np.concatenate((pcm_buf, chunk))
 
     thresh_s = _param_str(params, "BodyWakeWordThreshold") or str(DEFAULT_THRESHOLD)
@@ -202,9 +206,10 @@ def main():
       if now - last_summary >= SUMMARY_INTERVAL_S:
         _log(f"bodywaked: summary | inferences={inference_count} detections={detections} "
              f"max_score={max_score:.4f} max_notable={max_score_above_floor:.4f} "
-             f"threshold={threshold:.2f}")
+             f"threshold={threshold:.2f} audio_rms_max={audio_rms_max:.0f} chunks={audio_chunks_received}")
         max_score = 0.0
         max_score_above_floor = 0.0
+        audio_rms_max = 0.0
         last_summary = now
 
 
