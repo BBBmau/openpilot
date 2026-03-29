@@ -768,11 +768,10 @@ async def run_session(
   # Commits during an active response are dropped (not queued)—echo was chaining response.create.
   ignore_response_create_until = [0.0]
   response_busy = False
-  pending_response_create = False
   _recent_response_ts: list[float] = []
-  _LOOP_WINDOW_S = 15.0
-  _LOOP_THRESHOLD = 3
-  _LOOP_COOLDOWN_S = 8.0
+  _LOOP_WINDOW_S = 12.0
+  _LOOP_THRESHOLD = 2
+  _LOOP_COOLDOWN_S = 10.0
 
   responses_done_ids: set[str] = set()
   response_done_waiters: dict[str, asyncio.Event] = {}
@@ -852,7 +851,7 @@ async def run_session(
       vision_suppress_commits[0] -= 1
 
   def _send_response_create() -> None:
-    nonlocal response_busy, pending_response_create
+    nonlocal response_busy
     if dc.readyState != "open":
       LOG.warning("data channel not open; skipping response.create")
       return
@@ -872,7 +871,7 @@ async def run_session(
       return
 
   def _on_input_committed() -> None:
-    nonlocal response_busy, pending_response_create
+    nonlocal response_busy
     if server_auto_response:
       return
     if vision_suppress_commits[0] > 0:
@@ -898,16 +897,13 @@ async def run_session(
     _send_response_create()
 
   def _on_response_done() -> None:
-    nonlocal response_busy, pending_response_create
+    nonlocal response_busy
     if server_auto_response:
       return
     response_busy = False
-    if pending_response_create:
-      pending_response_create = False
-      _send_response_create()
 
   def on_dc_message(message: str | bytes) -> None:
-    nonlocal dc_messages, response_busy, pending_response_create
+    nonlocal dc_messages, response_busy
     if isinstance(message, bytes):
       message = message.decode("utf-8", errors="replace")
     try:
@@ -970,7 +966,6 @@ async def run_session(
           ignore_response_create_until[0],
           now_sync + _LOOP_COOLDOWN_S,
         )
-        pending_response_create = False
         _recent_response_ts.clear()
       if dc.readyState == "open":
         try:
@@ -982,6 +977,11 @@ async def run_session(
     if gate is not None:
       if typ == "response.created":
         gate.on_response_created()
+        if dc.readyState == "open":
+          try:
+            dc.send(json.dumps({"type": "input_audio_buffer.clear"}))
+          except Exception:
+            pass
       elif typ in _OUTPUT_BUFFER_STARTED_TYPES:
         gate.on_output_buffer_started()
       elif typ in _OUTPUT_BUFFER_STOPPED_TYPES:
@@ -994,12 +994,11 @@ async def run_session(
       err = ev.get("error") or {}
       code = err.get("code")
       if not server_auto_response and code == "conversation_already_has_active_response":
-        pending_response_create = True
         response_busy = True
         if gate is not None:
           gate.ensure_response_active()
         LOG.warning(
-          "Realtime: active response in progress; queued deferred response.create (%s)",
+          "Realtime: active response in progress; dropping commit (echo guard) (%s)",
           ev.get("event_id", ""),
         )
       else:
@@ -1026,13 +1025,18 @@ async def run_session(
   if half_duplex and gate is not None:
     gate.set_on_uplink_arm(mic.flush_uplink_buffer)
 
-    def _on_uplink_unmute() -> None:
+    def _clear_input_buffer() -> None:
       if dc.readyState == "open":
         try:
           dc.send(json.dumps({"type": "input_audio_buffer.clear"}))
-          LOG.debug("half-duplex: input_audio_buffer.clear on unmute")
         except Exception:
           pass
+
+    def _on_uplink_unmute() -> None:
+      _clear_input_buffer()
+      loop.call_later(0.4, _clear_input_buffer)
+      loop.call_later(0.8, _clear_input_buffer)
+      LOG.debug("half-duplex: input_audio_buffer.clear on unmute (+ delayed)")
       ignore_response_create_until[0] = max(
         ignore_response_create_until[0],
         time.monotonic() + post_response_commit_cooldown_s,
@@ -1061,21 +1065,25 @@ async def run_session(
   pc.addTrack(mic)
 
   stop = asyncio.Event()
-  micd_suppress_task: asyncio.Task[None] | None = None
-  if micd_suppress_during_assistant and gate is not None:
+  gate_poller_task: asyncio.Task[None] | None = None
+  if gate is not None:
 
-    async def _micd_suppress_loop() -> None:
+    async def _gate_poller() -> None:
       p = Params()
       prev = gate.suppress_uplink()
-      p.put_bool("MicdSuppressRawAudio", prev)
+      if micd_suppress_during_assistant:
+        p.put_bool("MicdSuppressRawAudio", prev)
+      p.put_bool("BodyVoiceAssistantListening", not prev)
       while not stop.is_set():
         cur = gate.suppress_uplink()
         if cur != prev:
-          p.put_bool("MicdSuppressRawAudio", cur)
+          if micd_suppress_during_assistant:
+            p.put_bool("MicdSuppressRawAudio", cur)
+          p.put_bool("BodyVoiceAssistantListening", not cur)
           prev = cur
         await asyncio.sleep(0.005)
 
-    micd_suppress_task = asyncio.create_task(_micd_suppress_loop())
+    gate_poller_task = asyncio.create_task(_gate_poller())
 
   def request_stop() -> None:
     stop.set()
@@ -1107,6 +1115,7 @@ async def run_session(
       dc.readyState,
     )
 
+    Params().put_bool("BodyVoiceAssistantActive", True)
     print(
       "\nConnected (WebRTC). Speaking into the comma mic; assistant plays like a webrtcd caller. Ctrl+C to stop.\n",
       flush=True,
@@ -1122,13 +1131,16 @@ async def run_session(
 
     await stop.wait()
   finally:
-    if micd_suppress_task is not None:
-      micd_suppress_task.cancel()
+    if gate_poller_task is not None:
+      gate_poller_task.cancel()
       try:
-        await micd_suppress_task
+        await gate_poller_task
       except asyncio.CancelledError:
         pass
-    Params().put_bool_nonblocking("MicdSuppressRawAudio", False)
+    p_cleanup = Params()
+    p_cleanup.put_bool_nonblocking("MicdSuppressRawAudio", False)
+    p_cleanup.put_bool_nonblocking("BodyVoiceAssistantListening", False)
+    p_cleanup.put_bool_nonblocking("BodyVoiceAssistantActive", False)
     for sig in (signal.SIGINT, signal.SIGTERM):
       try:
         loop.remove_signal_handler(sig)
@@ -1172,8 +1184,9 @@ def main() -> None:
   parser.add_argument(
     "--vad-mode",
     choices=("server_vad", "semantic_vad"),
-    default="server_vad",
-    help="Realtime turn detection: server_vad uses silence (tune threshold/silence); semantic_vad uses utterance semantics",
+    default="semantic_vad",
+    help="Realtime turn detection: semantic_vad (default) uses AI to distinguish real speech from echo; "
+    "server_vad uses silence threshold (more echo-prone on speakers)",
   )
   parser.add_argument(
     "--vad-threshold",
@@ -1258,10 +1271,10 @@ def main() -> None:
   parser.add_argument(
     "--post-response-commit-cooldown",
     type=float,
-    default=1.0,
+    default=1.5,
     metavar="SEC",
     help="Do not send response.create on input_audio_buffer.committed until this long after response.done / unmute "
-    "(default 1.0; increase if echo commits still slip through)",
+    "(default 1.5; increase if echo commits still slip through)",
   )
   parser.add_argument(
     "--micd-suppress-during-assistant/--no-micd-suppress-during-assistant",

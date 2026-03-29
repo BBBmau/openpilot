@@ -87,6 +87,7 @@ class UIState:
     self._param_update_time: float = 0.0
     # Envelope of downlink assistant PCM (webrtc / OpenAI realtime → soundd) for body talking animation.
     self.assistant_downlink_rms: float = 0.0
+    self._body_assistant_listening: bool = False
 
     # Callbacks
     self._offroad_transition_callbacks: list[Callable[[], None]] = []
@@ -117,6 +118,10 @@ class UIState:
   @property
   def body_assistant_speaking(self) -> bool:
     return self.assistant_downlink_rms > 0.02
+
+  @property
+  def body_assistant_listening(self) -> bool:
+    return self._body_assistant_listening
 
   def update(self) -> None:
     self.prime_state.start()  # start thread after manager forks ui
@@ -155,6 +160,7 @@ class UIState:
     self.recording_audio = self.params.get_bool("RecordAudio") and self.started
     self.joystick_debug_mode = self.params.get_bool("JoystickDebugMode")
     self.body_voice_session = self.params.get_bool("BodyVoiceAssistantActive")
+    self._body_assistant_listening = self.body_voice_session and self.params.get_bool("BodyVoiceAssistantListening")
 
     self.is_metric = self.params.get_bool("IsMetric")
     self.always_on_dm = self.params.get_bool("AlwaysOnDM")

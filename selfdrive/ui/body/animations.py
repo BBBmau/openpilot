@@ -184,6 +184,17 @@ INQUISITIVE = Animation(
   repeat_interval=10
 )
 
+MOUTH_LISTEN = [
+  (6, 7), (6, 8),
+  (7, 7), (7, 8),
+]
+
+LISTENING = Animation(
+  frames=[
+    _make_frame(EYE_OPEN, _mirror(EYE_OPEN), BROW_HIGH, _mirror(BROW_HIGH), MOUTH_LISTEN),
+  ],
+)
+
 WINK = Animation(
   frames=[
     _make_frame(EYE_OPEN, _mirror(EYE_OPEN), BROW_HIGH, _mirror(BROW_HIGH), MOUTH_SMILE),

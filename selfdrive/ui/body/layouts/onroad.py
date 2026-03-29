@@ -15,6 +15,7 @@ from openpilot.selfdrive.ui.body.animations import (
   ASLEEP,
   FACE_EYES_OPEN_BROWS,
   INQUISITIVE,
+  LISTENING,
   MOUTH_TALK_FRAMES,
   NORMAL,
   SLEEPY,
@@ -96,7 +97,9 @@ class BodyLayout(Widget):
       if has_input:
         self._last_input_time = time.monotonic()
 
-      if time.monotonic() - self._last_input_time > IDLE_TIMEOUT:
+      if ui_state.body_assistant_listening:
+        self._animator.set_animation(LISTENING)
+      elif time.monotonic() - self._last_input_time > IDLE_TIMEOUT:
         self._animator.set_animation(INQUISITIVE)
       else:
         self._animator.set_animation(NORMAL)
@@ -131,9 +134,12 @@ class BodyLayout(Widget):
 
   def _render(self, rect: rl.Rectangle):
     dots = self._animator.get_dots()
+    color = None
     if ui_state.body_assistant_speaking:
       phase = int(time.monotonic() * 10.0) % len(MOUTH_TALK_FRAMES)
       dots = list(FACE_EYES_OPEN_BROWS) + list(MOUTH_TALK_FRAMES[phase])
+    elif ui_state.body_assistant_listening:
+      color = rl.Color(100, 200, 255, 255)
     animation = self._animator._animation
     if self._turning_left and animation.left_turn_remove:
       remove_set = set(animation.left_turn_remove)
@@ -141,7 +147,7 @@ class BodyLayout(Widget):
     elif self._turning_right and animation.right_turn_remove:
       remove_set = set(animation.right_turn_remove)
       dots = [d for d in dots if d not in remove_set]
-    self.draw_dot_grid(rect, dots)
+    self.draw_dot_grid(rect, dots, color)
     if gui_app.big_ui():
       if ui_state.joystick_debug_mode:
         for widget in gui_app._nav_stack:
