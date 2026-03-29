@@ -45,6 +45,9 @@ a **drain tail** that keeps the mic muted while audio is still playing. The drai
 ``BodySpeaker`` and keeps the mic muted until the speaker has been quiet for the tail duration; and
 **soundd queue depth** (``--half-duplex-unmute-below-samples``, requires ``hasSplitTelemetry``).
 The mic unmutes only when both signals agree (or are disabled/unavailable).
+When the drain finishes, a **post-drain silence period** (``--commit-grace-after-unmute``) keeps
+the mic sending silence so echo never reaches the server; then the input buffer is cleared and the
+commit cooldown is restarted.
 ``--half-duplex-max-drain-wait`` caps how long we wait. Set ``--speaker-tail 0`` to disable local
 tracking; set samples to **0** to skip the queue check. ``MicdSuppressRawAudio`` follows the same
 gate. Use ``--no-half-duplex`` for full-duplex (e.g. headset).
@@ -59,6 +62,7 @@ With ``--server-auto-response`` off (the default), the client sends ``response.c
 ``input_audio_buffer.committed`` while idle. Commits that arrive during an active response are
 **ignored** (not queued)—queuing echo commits caused assistant→mic→assistant loops. A post-response
 cooldown also blocks ``response.create`` briefly after ``response.done``.
+A **rapid-response detector** extends the cooldown if 4+ responses complete within 15 s.
 
 **User speech logging** (``--log-user-speech``, on by default): prints Realtime VAD events to stderr
 (``speech_started`` / ``speech_stopped`` / ``committed``, etc.). Add ``--input-transcription`` to
@@ -71,6 +75,9 @@ webrtcd: ``livestreamDriverEncodeData`` / ``livestreamWideRoadEncodeData`` from 
 PNG, POSTs to the Gemini multimodal API (``GEMINI_API_KEY`` or ``GOOGLE_API_KEY``), sends
 ``conversation.item.create`` with ``function_call_output``, then ``response.create`` for the spoken
 reply. Optional ``--screenshot-path`` / ``--screenshot-cmd`` override the camera for desktop testing.
+
+By default, the model **greets first** (``--greet``): a ``response.create`` is sent on connect so the
+user doesn't need to speak first. Use ``--no-greet`` to disable.
 
 Usage:
   export OPENAI_API_KEY=sk-...
@@ -240,12 +247,17 @@ class _OutputBufferHalfDuplexGate:
     self._drain_tail = False
     self._drain_deadline: float | None = None
     self._drain_force_logged = False
+    self._post_drain_mute_until = 0.0
     self._was_suppressed = False
     self._commit_grace_until = 0.0
     self._on_uplink_arm: Callable[[], None] | None = None
+    self._on_unmute: Callable[[], None] | None = None
 
   def set_on_uplink_arm(self, fn: Callable[[], None] | None) -> None:
     self._on_uplink_arm = fn
+
+  def set_on_unmute(self, fn: Callable[[], None] | None) -> None:
+    self._on_unmute = fn
 
   def _begin_drain_tail(self) -> None:
     self._drain_tail = True
@@ -259,9 +271,7 @@ class _OutputBufferHalfDuplexGate:
     now = time.monotonic()
     if self._pending_response or self._output_playing:
       result = True
-    elif not self._drain_tail:
-      result = False
-    else:
+    elif self._drain_tail:
       drain_timeout = (
         self._max_drain_wait_s > 0.0
         and self._drain_deadline is not None
@@ -272,7 +282,8 @@ class _OutputBufferHalfDuplexGate:
           LOG.warning("half-duplex: max drain wait %.1fs elapsed; forcing uplink unmute", self._max_drain_wait_s)
           self._drain_force_logged = True
         self._drain_tail = False
-        result = False
+        self._post_drain_mute_until = now + self._commit_grace_after_unmute_s
+        result = True
       else:
         sa = self._speaker_activity
         speaker_live = sa is not None and sa.is_active()
@@ -289,13 +300,23 @@ class _OutputBufferHalfDuplexGate:
           result = True
         else:
           self._drain_tail = False
-          result = False
+          self._post_drain_mute_until = now + self._commit_grace_after_unmute_s
+          result = True
+    elif now < self._post_drain_mute_until:
+      result = True
+    else:
+      result = False
 
     if self._was_suppressed and not result:
       self._commit_grace_until = max(
         self._commit_grace_until,
         now + self._commit_grace_after_unmute_s,
       )
+      if self._on_unmute is not None:
+        try:
+          self._on_unmute()
+        except Exception:
+          LOG.exception("half-duplex on_unmute callback failed")
     self._was_suppressed = result
     return result
 
@@ -609,6 +630,7 @@ async def run_session(
   screenshot_cmd: str | None,
   vision_body_camera: str,
   vision_camera_timeout_s: float,
+  greet: bool,
 ) -> None:
   loop = asyncio.get_running_loop()
   soundd_watcher: _SounddQueueWatcher | None = None
@@ -731,10 +753,12 @@ async def run_session(
     LOG.debug("ICE gathering (outer): %s", pc.iceGatheringState)
 
   dc = pc.createDataChannel("oai-events")
+  dc_open_event = asyncio.Event()
 
   @dc.on("open")
   def _on_dc_open() -> None:
     LOG.info('Realtime data channel "oai-events" open (readyState=%s)', dc.readyState)
+    dc_open_event.set()
 
   @dc.on("close")
   def _on_dc_close() -> None:
@@ -745,6 +769,10 @@ async def run_session(
   ignore_response_create_until = [0.0]
   response_busy = False
   pending_response_create = False
+  _recent_response_ts: list[float] = []
+  _LOOP_WINDOW_S = 15.0
+  _LOOP_THRESHOLD = 3
+  _LOOP_COOLDOWN_S = 8.0
 
   responses_done_ids: set[str] = set()
   response_done_waiters: dict[str, asyncio.Event] = {}
@@ -931,6 +959,19 @@ async def run_session(
         ignore_response_create_until[0],
         now_sync + post_response_commit_cooldown_s,
       )
+      _recent_response_ts.append(now_sync)
+      _recent_response_ts[:] = [t for t in _recent_response_ts if now_sync - t < _LOOP_WINDOW_S]
+      if len(_recent_response_ts) >= _LOOP_THRESHOLD:
+        LOG.warning(
+          "echo loop detected: %d responses in %.0fs; extending cooldown %.1fs",
+          len(_recent_response_ts), _LOOP_WINDOW_S, _LOOP_COOLDOWN_S,
+        )
+        ignore_response_create_until[0] = max(
+          ignore_response_create_until[0],
+          now_sync + _LOOP_COOLDOWN_S,
+        )
+        pending_response_create = False
+        _recent_response_ts.clear()
       if dc.readyState == "open":
         try:
           dc.send(json.dumps({"type": "input_audio_buffer.clear"}))
@@ -984,6 +1025,20 @@ async def run_session(
 
   if half_duplex and gate is not None:
     gate.set_on_uplink_arm(mic.flush_uplink_buffer)
+
+    def _on_uplink_unmute() -> None:
+      if dc.readyState == "open":
+        try:
+          dc.send(json.dumps({"type": "input_audio_buffer.clear"}))
+          LOG.debug("half-duplex: input_audio_buffer.clear on unmute")
+        except Exception:
+          pass
+      ignore_response_create_until[0] = max(
+        ignore_response_create_until[0],
+        time.monotonic() + post_response_commit_cooldown_s,
+      )
+
+    gate.set_on_unmute(_on_uplink_unmute)
 
   speaker = BodySpeaker(
     pcm_service=BODY_REALTIME_PCM_SERVICE,
@@ -1056,6 +1111,14 @@ async def run_session(
       "\nConnected (WebRTC). Speaking into the comma mic; assistant plays like a webrtcd caller. Ctrl+C to stop.\n",
       flush=True,
     )
+
+    if greet:
+      try:
+        await asyncio.wait_for(dc_open_event.wait(), timeout=15.0)
+        _send_response_create()
+        LOG.info("greet: sent initial response.create (model speaks first)")
+      except asyncio.TimeoutError:
+        LOG.warning("greet: data channel did not open in 15s; skipping")
 
     await stop.wait()
   finally:
@@ -1151,6 +1214,12 @@ def main() -> None:
     help="Realtime input noise reduction before VAD (default far_field for room mic; near_field for close-talk; off to disable)",
   )
   parser.add_argument(
+    "--greet/--no-greet",
+    dest="greet",
+    default=True,
+    help="Have the model speak first on connect (sends response.create; default on)",
+  )
+  parser.add_argument(
     "--server-auto-response",
     action="store_true",
     help="Let the server call response.create on each committed turn (can error with conversation_already_has_active_response if VAD fires during playback)",
@@ -1179,20 +1248,20 @@ def main() -> None:
   parser.add_argument(
     "--speaker-tail",
     type=float,
-    default=0.5,
+    default=0.8,
     metavar="SEC",
     help=(
       "Keep mic muted for this long after the last non-silent audio output to the speaker "
-      "(local PCM tracking; avoids echo when soundd queue telemetry is unavailable; 0=disable; default 0.5)"
+      "(local PCM tracking; avoids echo when soundd queue telemetry is unavailable; 0=disable; default 0.8)"
     ),
   )
   parser.add_argument(
     "--post-response-commit-cooldown",
     type=float,
-    default=0.72,
+    default=1.0,
     metavar="SEC",
-    help="Do not send response.create on input_audio_buffer.committed until this long after response.done "
-    "(default 0.72; increase if commits race before uplink unmutes)",
+    help="Do not send response.create on input_audio_buffer.committed until this long after response.done / unmute "
+    "(default 1.0; increase if echo commits still slip through)",
   )
   parser.add_argument(
     "--micd-suppress-during-assistant/--no-micd-suppress-during-assistant",
@@ -1203,9 +1272,10 @@ def main() -> None:
   parser.add_argument(
     "--commit-grace-after-unmute",
     type=float,
-    default=0.2,
+    default=1.0,
     metavar="SEC",
-    help="After uplink unmutes, block response.create this long (default 0.2; echo buffer)",
+    help="Post-drain silence period: mic sends silence this long after speaker drain, then blocks commits equally long "
+    "(default 1.0; covers room echo + VAD latency)",
   )
   parser.add_argument(
     "--log-user-speech/--no-log-user-speech",
@@ -1370,6 +1440,7 @@ def main() -> None:
         screenshot_cmd=args.screenshot_cmd,
         vision_body_camera=vision_cam,
         vision_camera_timeout_s=args.vision_timeout,
+        greet=args.greet,
       )
     )
   except KeyboardInterrupt:
