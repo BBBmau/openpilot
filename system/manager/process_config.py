@@ -10,7 +10,10 @@ from openpilot.system.manager.process import PythonProcess, NativeProcess, Daemo
 WEBCAM = os.getenv("USE_WEBCAM") is not None
 
 def driverview(started: bool, params: Params, CP: car.CarParams) -> bool:
-  return started or params.get_bool("IsDriverViewEnabled")
+  """Vision for UI / DM; on comma body also when ``LiveIgnition`` so ``stream_encoderd`` can attach."""
+  if started or params.get_bool("IsDriverViewEnabled"):
+    return True
+  return CP.notCar and params.get_bool("LiveIgnition")
 
 def notcar(started: bool, params: Params, CP: car.CarParams) -> bool:
   return started and CP.notCar
@@ -96,7 +99,8 @@ procs = [
 
   NativeProcess("loggerd", "system/loggerd", ["./loggerd"], logging),
   NativeProcess("encoderd", "system/loggerd", ["./encoderd"], only_onroad),
-  NativeProcess("stream_encoderd", "system/loggerd", ["./encoderd", "--stream"], notcar),
+  # Same gate as webrtcd: livestream H.264 must flow whenever WebRTC stack runs (not only full onroad).
+  NativeProcess("stream_encoderd", "system/loggerd", ["./encoderd", "--stream"], comma_body_stack_should_run),
   PythonProcess("logmessaged", "system.logmessaged", always_run),
 
   NativeProcess("camerad", "system/camerad", ["./camerad"], driverview, enabled=not WEBCAM),

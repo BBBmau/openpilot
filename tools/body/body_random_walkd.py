@@ -33,12 +33,27 @@ On device: ``curl -sS 'http://127.0.0.1:5001/schema?services=' | head`` and conf
 
 Set env **BODY_RANDOM_WALK_VERBOSE=1** for full tracebacks on each failed attempt (noisy).
 
-**``BodyEnv.reset`` → ``TimeoutError``** (often with an empty message): bodyjim’s first
-``receive()`` waits only **2s** by default for decoded camera frames. On-device WebRTC + H.264
-often need longer until the first keyframe. This script raises
-``BODY_RANDOM_WALK_RECEIVE_TIMEOUT`` (default **15** seconds) on ``bodyjim.data_stream`` before
-importing ``BodyEnv``. Override with e.g. ``export BODY_RANDOM_WALK_RECEIVE_TIMEOUT=30``.
-Optional ``BODY_RANDOM_WALK_CONNECT_TIMEOUT`` overrides the 3s WebRTC connect wait.
+**``BodyEnv.reset`` → ``TimeoutError``** (~``RECEIVE_TIMEOUT``): bodyjim’s first ``receive()``
+blocks until **decoded frames exist for every requested camera**. ``webrtcd`` (see
+``system/webrtc/webrtcd.py``) publishes **one** outgoing video track named from the
+``LivestreamCamera`` param (``driver`` or ``wideRoad``), not “whatever the client asked for”.
+If this script used ``["driver"]`` while the param was ``wideRoad``, bodyjim would wait on the
+wrong track and hit ``Future.result(timeout)`` with an empty message. The camera list is therefore
+aligned with ``LivestreamCamera`` by default; override with ``BODY_RANDOM_WALK_CAMERAS=wideRoad``
+(or ``driver``) if needed.
+
+Also raise ``BODY_RANDOM_WALK_RECEIVE_TIMEOUT`` (default **15** s) if the encoder is slow to
+produce a keyframe. Optional ``BODY_RANDOM_WALK_CONNECT_TIMEOUT`` overrides the 3s WebRTC connect wait.
+
+Set **``BODY_RANDOM_WALK_DEBUG=1``** for extra logs: configured timeouts, monotonic elapsed time
+around ``reset()``, and a snapshot of bodyjim’s ``DataStreamSession`` (runner thread, data channel,
+camera tracks) after a failed ``reset``.
+
+On **TimeoutError** during ``reset``, the script probes the matching ``livestream*EncodeData`` socket
+for a few seconds (override with ``BODY_RANDOM_WALK_PIPELINE_PROBE_S``). No packets usually means
+``stream_encoderd`` or ``camerad`` is not running — historically ``stream_encoderd`` only ran when
+``deviceState.started`` (onroad) while ``webrtcd`` could run on ``LiveIgnition`` alone; openpilot
+aligns those gates in ``system/manager/process_config.py`` (restart manager after updating).
 """
 from __future__ import annotations
 
@@ -54,6 +69,31 @@ from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
 
 _VERBOSE = os.environ.get("BODY_RANDOM_WALK_VERBOSE", "").strip().lower() in ("1", "true", "yes")
+_DEBUG = os.environ.get("BODY_RANDOM_WALK_DEBUG", "").strip().lower() in ("1", "true", "yes")
+
+
+def _bodyjim_cameras(params: Params) -> list[str]:
+  """Single camera name bodyjim should receive — must match webrtcd's outgoing track (``LivestreamCamera``)."""
+  raw = os.environ.get("BODY_RANDOM_WALK_CAMERAS", "").strip()
+  if raw:
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    if parts:
+      if len(parts) > 1:
+        cloudlog.warning(
+          "body_random_walkd: webrtcd publishes one video track; using first camera from BODY_RANDOM_WALK_CAMERAS=%r",
+          raw,
+        )
+      cam = parts[0]
+      if cam in ("driver", "wideRoad"):
+        return [cam]
+      cloudlog.warning(
+        "body_random_walkd: invalid BODY_RANDOM_WALK_CAMERAS=%r (want driver or wideRoad); using LivestreamCamera param",
+        cam,
+      )
+  active = params.get("LivestreamCamera") or "driver"
+  if active not in ("driver", "wideRoad"):
+    active = "driver"
+  return [active]
 
 
 def _patch_bodyjim_timeouts() -> None:
@@ -83,15 +123,128 @@ def _patch_bodyjim_timeouts() -> None:
   )
 
 
-def _log_connect_failure(stage: str, err: BaseException) -> None:
+def _log_connect_failure(stage: str, err: BaseException, *, elapsed_s: float | None = None) -> None:
+  elapsed = f" after {elapsed_s:.2f}s" if elapsed_s is not None else ""
+  detail = str(err) if str(err) else (
+    "(empty message — typical of Future.result(timeout) while waiting for decoded video from webrtcd)"
+  )
   cloudlog.warning(
-    "body_random_walkd: %s failed: %s: %s",
+    "body_random_walkd: %s failed%s: %s: %s",
     stage,
+    elapsed,
     type(err).__name__,
-    err,
+    detail,
   )
   if _VERBOSE:
     cloudlog.exception("body_random_walkd: %s traceback", stage)
+
+
+def _log_bodyjim_stream_debug(env: object, label: str) -> None:
+  """Best-effort snapshot of bodyjim DataStreamSession (private attrs; API may differ by version)."""
+  if not _DEBUG:
+    return
+  try:
+    import bodyjim.data_stream as bj_ds  # noqa: PLC0415
+
+    cloudlog.info(
+      "body_random_walkd: %s bodyjim RECEIVE_TIMEOUT_SECONDS=%.3f CONNECT_TIMEOUT_SECONDS=%.3f",
+      label,
+      bj_ds.RECEIVE_TIMEOUT_SECONDS,
+      bj_ds.CONNECT_TIMEOUT_SECONDS,
+    )
+  except Exception as e:
+    cloudlog.warning("body_random_walkd: %s could not read bodyjim.data_stream timeouts: %s", label, e)
+
+  ds_sess = getattr(env, "_data_stream", None)
+  cloudlog.info("body_random_walkd: %s env._data_stream is None=%s", label, ds_sess is None)
+  if ds_sess is None:
+    return
+
+  th = getattr(ds_sess, "_runner_thread", None)
+  th_alive = th.is_alive() if th is not None else None
+  ch = getattr(ds_sess, "_channel", None)
+  tracks = getattr(ds_sess, "_camera_tracks", None)
+  track_keys = list(tracks.keys()) if isinstance(tracks, dict) else None
+  cams = getattr(ds_sess, "_cameras", None)
+  cloudlog.info(
+    "body_random_walkd: %s stream runner_alive=%s data_channel_open=%s cameras=%r track_keys=%s",
+    label,
+    th_alive,
+    ch is not None,
+    cams,
+    track_keys,
+  )
+
+
+def _log_livestream_pipeline_diagnosis(cameras: list[str], params: Params) -> None:
+  """If msgq has no livestream encode data, WebRTC cannot send video; log gates and probe the topic."""
+  import cereal.messaging as messaging  # noqa: PLC0415
+
+  cam = cameras[0] if cameras else "driver"
+  try:
+    from openpilot.system.webrtc.device.video import LiveStreamVideoStreamTrack  # noqa: PLC0415
+
+    service = LiveStreamVideoStreamTrack.camera_to_sock_mapping[cam]
+  except Exception as e:
+    cloudlog.warning("body_random_walkd: pipeline diagnosis: camera %r: %s", cam, e)
+    return
+
+  probe_s = 2.0
+  raw = os.environ.get("BODY_RANDOM_WALK_PIPELINE_PROBE_S", "").strip()
+  if raw:
+    try:
+      probe_s = max(0.2, min(30.0, float(raw)))
+    except ValueError:
+      cloudlog.warning("body_random_walkd: invalid BODY_RANDOM_WALK_PIPELINE_PROBE_S=%r", raw)
+
+  sm = messaging.SubMaster(["deviceState", "carParams"])
+  for _ in range(100):
+    sm.update(100)
+    if sm.seen["deviceState"] and sm.seen["carParams"]:
+      break
+
+  started = bool(sm["deviceState"].started) if sm.seen["deviceState"] else None
+  not_car = bool(sm["carParams"].notCar) if sm.seen["carParams"] else None
+  cloudlog.warning(
+    "body_random_walkd: pipeline snapshot: deviceState.started=%s carParams.notCar=%s "
+    "LiveIgnition=%s IsDriverViewEnabled=%s LivestreamCamera=%r bodyjim_cameras=%r",
+    started,
+    not_car,
+    params.get_bool("LiveIgnition"),
+    params.get_bool("IsDriverViewEnabled"),
+    params.get("LivestreamCamera") or "driver",
+    cameras,
+  )
+
+  sock = messaging.sub_sock(service, conflate=False)
+  deadline = time.monotonic() + probe_s
+  got = 0
+  last_mono = None
+  while time.monotonic() < deadline:
+    msg = messaging.recv_one_or_none(sock)
+    if msg is not None:
+      got += 1
+      last_mono = msg.logMonoTime
+      break
+    time.sleep(0.05)
+
+  if got:
+    cloudlog.warning(
+      "body_random_walkd: pipeline: got %s on %s within %.1fs (logMonoTime=%s) — "
+      "H.264 is reaching msgq; stall is likely WebRTC offer/answer, decode, or bodyjim recv path",
+      got,
+      service,
+      probe_s,
+      last_mono,
+    )
+  else:
+    cloudlog.warning(
+      "body_random_walkd: pipeline: no messages on %s within %.1fs — need camerad + stream_encoderd. "
+      "For comma body with ignition but not onroad, manager must run stream_encoderd and camerad "
+      "under the same conditions as webrtcd (see comma_body_stack_should_run / driverview in process_config).",
+      service,
+      probe_s,
+    )
 
 
 def _prime_webrtc_datachannel(env, should_stop: Callable[[], bool], *, timeout_s: float = 20.0) -> bool:
@@ -163,7 +316,11 @@ def main() -> None:
 
   render_mode = "human" if human else None
   body_ip = "127.0.0.1"
-  cameras = ["driver"]
+  cameras = _bodyjim_cameras(params)
+  cloudlog.info(
+    "body_random_walkd: bodyjim cameras=%r (must match webrtcd track from LivestreamCamera param unless BODY_RANDOM_WALK_CAMERAS is set)",
+    cameras,
+  )
 
   while not stop:
     env = None
@@ -181,10 +338,33 @@ def main() -> None:
           time.sleep(1.0)
           continue
 
+        t_reset: float | None = None
         try:
+          import bodyjim.data_stream as bj_ds  # noqa: PLC0415
+
+          cloudlog.info(
+            "body_random_walkd: BodyEnv.reset() starting cameras=%r "
+            "(bodyjim receive_timeout=%.1fs connect_timeout=%.1fs)",
+            cameras,
+            bj_ds.RECEIVE_TIMEOUT_SECONDS,
+            bj_ds.CONNECT_TIMEOUT_SECONDS,
+          )
+          t_reset = time.monotonic()
           env_try.reset()
+          cloudlog.info(
+            "body_random_walkd: BodyEnv.reset() ok in %.2fs",
+            time.monotonic() - t_reset,
+          )
         except Exception as e:
-          _log_connect_failure("BodyEnv.reset (WebRTC / first frames)", e)
+          elapsed = (time.monotonic() - t_reset) if t_reset is not None else None
+          _log_connect_failure(
+            "BodyEnv.reset (WebRTC / first frames — wait_for_connection + first receive() per camera)",
+            e,
+            elapsed_s=elapsed,
+          )
+          if isinstance(e, TimeoutError):
+            _log_livestream_pipeline_diagnosis(cameras, params)
+          _log_bodyjim_stream_debug(env_try, "after failed reset")
           try:
             env_try.close()
           except Exception:
