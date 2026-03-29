@@ -61,6 +61,11 @@ def check_selfdrive_timeout_alert(sm):
   ss_missing = time.monotonic() - sm.recv_time['selfdriveState']
 
   if ss_missing > SELFDRIVE_STATE_TIMEOUT:
+    # Don't alarm when the device is offroad — selfdrived is intentionally stopped.
+    # On body, soundd stays running offroad; without this gate the timeout fires
+    # every ignition-off cycle and blares warningImmediate for ~10 s.
+    if sm.valid.get('deviceState') and not sm['deviceState'].started:
+      return False
     if sm['selfdriveState'].enabled and (ss_missing - SELFDRIVE_STATE_TIMEOUT) < 10:
       return True
 
@@ -225,7 +230,7 @@ class Soundd:
     # sounddevice must be imported after forking processes
     import sounddevice as sd
 
-    sm = messaging.SubMaster(['selfdriveState', 'soundPressure', 'soundRequest'], poll='selfdriveState')
+    sm = messaging.SubMaster(['selfdriveState', 'soundPressure', 'soundRequest', 'deviceState'], poll='selfdriveState')
     webrtc_pcm_sock = messaging.sub_sock('webrtcAudioData', conflate=False)
     body_pcm_sock = messaging.sub_sock('bodyRealtimeAudioData', conflate=False)
 
