@@ -39,12 +39,15 @@ use **far_field** noise shaping and a **higher VAD threshold**; raise ``--vad-th
 
 **Half-duplex uplink** (on by default): WebRTC uplink and (with ``--micd-suppress-during-assistant``)
 ``rawAudioData`` are muted while the assistant is “on the air”: from ``response.create`` (pre-RTT arm)
-until **``output_audio_buffer.stopped``** (or ``response.done`` if that event is missing), then until
-``soundd`` reports **``bodyRealtimeQueuedSamples`` ≤ ``--half-duplex-unmute-below-samples``** (needs
-``hasSplitTelemetry`` from current ``soundd``). Set samples to **0** to skip the queue check (faster
-unmute, more echo risk). ``--half-duplex-max-drain-wait`` caps how long we wait on the queue.
-``MicdSuppressRawAudio`` follows the same gate with blocking writes on 0↔1 edges. Use
-``--no-half-duplex`` for full-duplex (e.g. headset).
+until **``output_audio_buffer.stopped``** (or ``response.done`` if that event is missing), then through
+a **drain tail** that keeps the mic muted while audio is still playing. The drain uses two signals:
+**local speaker activity** (``--speaker-tail``, default 0.5 s) — tracks non-silent PCM published by
+``BodySpeaker`` and keeps the mic muted until the speaker has been quiet for the tail duration; and
+**soundd queue depth** (``--half-duplex-unmute-below-samples``, requires ``hasSplitTelemetry``).
+The mic unmutes only when both signals agree (or are disabled/unavailable).
+``--half-duplex-max-drain-wait`` caps how long we wait. Set ``--speaker-tail 0`` to disable local
+tracking; set samples to **0** to skip the queue check. ``MicdSuppressRawAudio`` follows the same
+gate. Use ``--no-half-duplex`` for full-duplex (e.g. headset).
 
 **micd** (device ``rawAudioData``): with ``--micd-suppress-during-assistant`` (default on, requires
 half-duplex), the script sets param ``MicdSuppressRawAudio`` in lockstep with that gate so **micd**
@@ -192,6 +195,29 @@ class _SounddQueueWatcher:
       return self._has_split_telemetry
 
 
+class _SpeakerActivityTracker:
+  """Tracks non-silent PCM published by BodySpeaker for local half-duplex drain."""
+
+  _SILENCE_RMS = 30
+
+  def __init__(self, tail_s: float = 0.5):
+    self._tail_s = tail_s
+    self._last_active = 0.0
+    self._lock = threading.Lock()
+
+  def on_pcm(self, pcm: np.ndarray) -> None:
+    if pcm.size == 0:
+      return
+    rms = float(np.sqrt(np.mean(pcm.astype(np.float32) ** 2)))
+    if rms > self._SILENCE_RMS:
+      with self._lock:
+        self._last_active = time.monotonic()
+
+  def is_active(self) -> bool:
+    with self._lock:
+      return (time.monotonic() - self._last_active) < self._tail_s
+
+
 class _OutputBufferHalfDuplexGate:
   """Mute using Realtime ``output_audio_buffer`` events + optional soundd body-queue threshold."""
 
@@ -199,11 +225,13 @@ class _OutputBufferHalfDuplexGate:
     self,
     *,
     soundd_queue: _SounddQueueWatcher | None,
+    speaker_activity: _SpeakerActivityTracker | None,
     unmute_below_samples: int,
     max_drain_wait_s: float,
     commit_grace_after_unmute_s: float,
   ) -> None:
     self._soundd_queue = soundd_queue
+    self._speaker_activity = speaker_activity
     self._unmute_below = max(0, int(unmute_below_samples))
     self._max_drain_wait_s = float(max_drain_wait_s)
     self._commit_grace_after_unmute_s = float(commit_grace_after_unmute_s)
@@ -234,34 +262,34 @@ class _OutputBufferHalfDuplexGate:
     elif not self._drain_tail:
       result = False
     else:
-      sq = self._soundd_queue
-      if (
-        self._unmute_below <= 0
-        or sq is None
-        or not sq.telemetry_ok()
-        or not sq.gate_uses_body_split()
-      ):
-        self._drain_tail = False
-        result = False
-      elif sq.gate_queue_depth_samples() <= self._unmute_below:
-        self._drain_tail = False
-        result = False
-      elif (
+      drain_timeout = (
         self._max_drain_wait_s > 0.0
         and self._drain_deadline is not None
         and now >= self._drain_deadline
-      ):
+      )
+      if drain_timeout:
         if not self._drain_force_logged:
-          LOG.warning(
-            "half-duplex: max drain wait %.1fs elapsed (bodyQueued=%d); forcing uplink unmute",
-            self._max_drain_wait_s,
-            sq.gate_queue_depth_samples(),
-          )
+          LOG.warning("half-duplex: max drain wait %.1fs elapsed; forcing uplink unmute", self._max_drain_wait_s)
           self._drain_force_logged = True
         self._drain_tail = False
         result = False
       else:
-        result = True
+        sa = self._speaker_activity
+        speaker_live = sa is not None and sa.is_active()
+        sq = self._soundd_queue
+        soundd_ok = (
+          self._unmute_below > 0
+          and sq is not None
+          and sq.telemetry_ok()
+          and sq.gate_uses_body_split()
+        )
+        if speaker_live:
+          result = True
+        elif soundd_ok and sq.gate_queue_depth_samples() > self._unmute_below:
+          result = True
+        else:
+          self._drain_tail = False
+          result = False
 
     if self._was_suppressed and not result:
       self._commit_grace_until = max(
@@ -567,6 +595,7 @@ async def run_session(
   half_duplex: bool,
   half_duplex_unmute_below_samples: int,
   half_duplex_max_drain_wait_s: float,
+  speaker_tail_s: float,
   post_response_commit_cooldown_s: float,
   micd_suppress_during_assistant: bool,
   commit_grace_after_unmute_s: float,
@@ -587,10 +616,15 @@ async def run_session(
     soundd_watcher = _SounddQueueWatcher()
     soundd_watcher.start()
 
+  speaker_tracker: _SpeakerActivityTracker | None = None
+  if half_duplex and speaker_tail_s > 0:
+    speaker_tracker = _SpeakerActivityTracker(tail_s=speaker_tail_s)
+
   gate: _OutputBufferHalfDuplexGate | None = None
   if half_duplex:
     gate = _OutputBufferHalfDuplexGate(
       soundd_queue=soundd_watcher,
+      speaker_activity=speaker_tracker,
       unmute_below_samples=half_duplex_unmute_below_samples,
       max_drain_wait_s=half_duplex_max_drain_wait_s,
       commit_grace_after_unmute_s=commit_grace_after_unmute_s,
@@ -661,6 +695,8 @@ async def run_session(
         "half-duplex: mute from response.create until output_audio_buffer.stopped/response.done; "
         "queue threshold disabled (unmute_below=0)",
       )
+    if speaker_tracker is not None:
+      LOG.info("half-duplex: local speaker activity tracking (tail=%.2fs); mic stays muted while audio output active", speaker_tail_s)
     if micd_suppress_during_assistant:
       LOG.info("micd: MicdSuppressRawAudio follows half-duplex (rawAudioData silence while gated)")
   elif micd_suppress_during_assistant:
@@ -953,6 +989,7 @@ async def run_session(
     pcm_service=BODY_REALTIME_PCM_SERVICE,
     pcm_gain=playback_gain,
     on_publish_sample_rate=_soundd_body_realtime_sample_rate_check,
+    on_downlink_pcm=speaker_tracker.on_pcm if speaker_tracker is not None else None,
   )
   audio_to_speaker_started = False
 
@@ -1140,6 +1177,16 @@ def main() -> None:
     help="Force uplink unmute after this long waiting for queue<=threshold (0=disable timeout; default 3)",
   )
   parser.add_argument(
+    "--speaker-tail",
+    type=float,
+    default=0.5,
+    metavar="SEC",
+    help=(
+      "Keep mic muted for this long after the last non-silent audio output to the speaker "
+      "(local PCM tracking; avoids echo when soundd queue telemetry is unavailable; 0=disable; default 0.5)"
+    ),
+  )
+  parser.add_argument(
     "--post-response-commit-cooldown",
     type=float,
     default=0.72,
@@ -1245,6 +1292,9 @@ def main() -> None:
   if args.half_duplex_max_drain_wait < 0:
     print("--half-duplex-max-drain-wait must be >= 0", file=sys.stderr)
     sys.exit(1)
+  if args.speaker_tail < 0:
+    print("--speaker-tail must be >= 0", file=sys.stderr)
+    sys.exit(1)
   if args.commit_grace_after_unmute < 0:
     print("--commit-grace-after-unmute must be >= 0", file=sys.stderr)
     sys.exit(1)
@@ -1306,6 +1356,7 @@ def main() -> None:
         half_duplex=args.half_duplex,
         half_duplex_unmute_below_samples=args.half_duplex_unmute_below_samples,
         half_duplex_max_drain_wait_s=args.half_duplex_max_drain_wait,
+        speaker_tail_s=args.speaker_tail,
         post_response_commit_cooldown_s=args.post_response_commit_cooldown,
         micd_suppress_during_assistant=args.micd_suppress_during_assistant,
         commit_grace_after_unmute_s=args.commit_grace_after_unmute,
