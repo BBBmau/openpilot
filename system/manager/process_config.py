@@ -95,19 +95,22 @@ def soundd_should_run(started: bool, params: Params, CP: car.CarParams) -> bool:
 
 
 def bodywaked_should_run(started: bool, params: Params, CP: car.CarParams) -> bool:
-  return params.get_bool("BodyWakeWordEnabled")
+  """Wake-word listener: only active when ignition is physically ON."""
+  return started and (_is_body(CP, params) or params.get_bool("BodyWakeWordEnabled"))
 
 
 def comma_body_stack_should_run(started: bool, params: Params, CP: car.CarParams) -> bool:
-  """Comma body: WebRTC/bridge/random-walk run when ignition is on.
-
-  Uses _is_body fallback so the stack starts even before card publishes
-  carParams (e.g. wake-word boot).  BodyWakeWordEnabled acts as a secondary
-  body-device indicator when CarParamsPersistent is unavailable.
-  """
+  """Comma body infrastructure (WebRTC/bridge/stream encoder) while ignition is on."""
   if not (_is_body(CP, params) or params.get_bool("BodyWakeWordEnabled")):
     return False
-  return started or params.get_bool("LiveIgnition") or params.get_bool("BodyWakeIgnition")
+  return started or params.get_bool("LiveIgnition")
+
+
+def body_wake_active(started: bool, params: Params, CP: car.CarParams) -> bool:
+  """Voice assistant + walk daemon: only after wake word sets BodyWakeIgnition."""
+  if not (_is_body(CP, params) or params.get_bool("BodyWakeWordEnabled")):
+    return False
+  return params.get_bool("BodyWakeIgnition")
 
 def only_offroad(started: bool, params: Params, CP: car.CarParams) -> bool:
   return not started
@@ -170,8 +173,8 @@ procs = [
   # debug procs
   NativeProcess("bridge", "cereal/messaging", ["./bridge"], comma_body_stack_should_run),
   PythonProcess("webrtcd", "system.webrtc.webrtcd", comma_body_stack_should_run),
-  PythonProcess("bodyrandomwalkd", "tools.body.body_random_walkd", comma_body_stack_should_run),
-  PythonProcess("openai_realtime_webrtcd", "tools.body.openai_realtime_webrtc", comma_body_stack_should_run),
+  PythonProcess("bodyrandomwalkd", "tools.body.body_random_walkd", body_wake_active),
+  PythonProcess("openai_realtime_webrtcd", "tools.body.openai_realtime_webrtc", body_wake_active),
   PythonProcess("joystick", "tools.joystick.joystick_control", and_(joystick, iscar)),
 ]
 
