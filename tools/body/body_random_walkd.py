@@ -46,8 +46,9 @@ Also raise ``BODY_RANDOM_WALK_RECEIVE_TIMEOUT`` (default **15** s) if the encode
 produce a keyframe. Optional ``BODY_RANDOM_WALK_CONNECT_TIMEOUT`` overrides the 3s WebRTC connect wait.
 
 Set **``BODY_RANDOM_WALK_DEBUG=1``** for extra logs: configured timeouts, monotonic elapsed time
-around ``reset()``, and a snapshot of bodyjim’s ``DataStreamSession`` (runner thread, data channel,
-camera tracks) after a failed ``reset``.
+around ``reset()``, a snapshot of bodyjim’s ``DataStreamSession`` after a failed ``reset``, and a
+short **burst scan** of ``livestream*EncodeData`` (how many messages look like WebRTC sync points vs P-frames).
+Set **``BODY_RANDOM_WALK_PIPELINE_BURST=1``** alone to log that burst scan without full debug noise.
 
 On **TimeoutError** during ``reset``, the script probes the matching ``livestream*EncodeData`` socket
 for a few seconds (override with ``BODY_RANDOM_WALK_PIPELINE_PROBE_S``). No packets usually means
@@ -70,6 +71,7 @@ from openpilot.common.swaglog import cloudlog
 
 _VERBOSE = os.environ.get("BODY_RANDOM_WALK_VERBOSE", "").strip().lower() in ("1", "true", "yes")
 _DEBUG = os.environ.get("BODY_RANDOM_WALK_DEBUG", "").strip().lower() in ("1", "true", "yes")
+_PIPELINE_BURST = os.environ.get("BODY_RANDOM_WALK_PIPELINE_BURST", "").strip().lower() in ("1", "true", "yes")
 
 
 def _bodyjim_cameras(params: Params) -> list[str]:
@@ -176,13 +178,42 @@ def _log_bodyjim_stream_debug(env: object, label: str) -> None:
   )
 
 
+def _log_livestream_sync_burst_scan(sock: object, service: str, *, max_msgs: int = 40, budget_s: float = 1.0) -> None:
+  """Read a few more encoded frames on the same subscriber — sync_ok counts match LiveStreamVideoStreamTrack logic."""
+  import cereal.messaging as messaging  # noqa: PLC0415
+
+  from openpilot.system.webrtc.device.video import livestream_encode_data_diag  # noqa: PLC0415
+
+  deadline = time.monotonic() + budget_s
+  n_ok = n_tot = 0
+  while time.monotonic() < deadline and n_tot < max_msgs:
+    msg = messaging.recv_one_or_none(sock)
+    if msg is None:
+      time.sleep(0.005)
+      continue
+    n_tot += 1
+    if livestream_encode_data_diag(msg)["sync_ok"]:
+      n_ok += 1
+  cloudlog.info(
+    "body_random_walkd: pipeline: burst on %s: read %d msgs in ≤%.2fs (%d track_sync_ok) — "
+    "if sync_ok>0 but reset fails, video likely dies after msgq (WebRTC / bodyjim decode).",
+    service,
+    n_tot,
+    budget_s,
+    n_ok,
+  )
+
+
 def _log_livestream_pipeline_diagnosis(cameras: list[str], params: Params) -> None:
   """If msgq has no livestream encode data, WebRTC cannot send video; log gates and probe the topic."""
   import cereal.messaging as messaging  # noqa: PLC0415
 
   cam = cameras[0] if cameras else "driver"
   try:
-    from openpilot.system.webrtc.device.video import LiveStreamVideoStreamTrack  # noqa: PLC0415
+    from openpilot.system.webrtc.device.video import (  # noqa: PLC0415
+      LiveStreamVideoStreamTrack,
+      livestream_encode_data_diag,
+    )
 
     service = LiveStreamVideoStreamTrack.camera_to_sock_mapping[cam]
   except Exception as e:
@@ -231,16 +262,27 @@ def _log_livestream_pipeline_diagnosis(cameras: list[str], params: Params) -> No
     time.sleep(0.05)
 
   if got:
+    diag = livestream_encode_data_diag(msg)
     cloudlog.warning(
-      "body_random_walkd: pipeline: got %s on %s within %.1fs (logMonoTime=%s) — "
-      "msgq is fine; if BodyEnv.reset still times out, check WebRTC (ICE/SDP), bodyjim decode, or "
-      "that LiveStreamVideoStreamTrack starts on a keyframe (SPS/PPS only on IDRs in encoder.cc; "
-      "see system/webrtc/device/video.py).",
-      got,
+      "body_random_walkd: pipeline: msgq ok — %s within %.1fs logMonoTime=%s",
       service,
       probe_s,
       last_mono,
     )
+    cloudlog.warning(
+      "body_random_walkd: pipeline: first frame which=%s encodeType=%s flags=0x%x keyframe_bit=%s "
+      "header=%dB data=%dB track_sync_ok=%s — if track_sync_ok is False, webrtcd may spin until an "
+      "IDR; if True but reset still fails, check WebRTC (ICE/SDP) and bodyjim H264 decode.",
+      diag["which"],
+      diag["encode_type"],
+      diag["flags"],
+      diag["keyframe_bit"],
+      diag["header_bytes"],
+      diag["data_bytes"],
+      diag["sync_ok"],
+    )
+    if _DEBUG or _PIPELINE_BURST:
+      _log_livestream_sync_burst_scan(sock, service)
   else:
     cloudlog.warning(
       "body_random_walkd: pipeline: no messages on %s within %.1fs — need camerad + stream_encoderd. "

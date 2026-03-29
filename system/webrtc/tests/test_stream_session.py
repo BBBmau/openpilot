@@ -86,3 +86,17 @@ class TestStreamSession:
         start_pts = packet.pts
       assert abs(i + packet.pts - (start_pts + (((time.monotonic_ns() - start_ns) * VIDEO_CLOCK_RATE) // 1_000_000_000))) < 450 #5ms
       assert packet.size == len(fake_msg.livestreamDriverEncodeData.data)
+
+  def test_livestream_track_sync_via_header_when_keyframe_bit_missing(self, mocker):
+    """QCOM capture buffers may omit V4L2 KEYFRAME in idx.flags; encoder.cc still fills header on IDRs."""
+    fake_msg = messaging.new_message("livestreamDriverEncodeData")
+    fake_msg.livestreamDriverEncodeData.idx.flags = 0
+    fake_msg.livestreamDriverEncodeData.header = b"\x00\x00\x00\x01\x67ds"
+    fake_msg.livestreamDriverEncodeData.data = b"\x00\x00\x00\x01\x65id"
+
+    config = {"receive.return_value": fake_msg.to_bytes()}
+    mocker.patch("msgq.SubSocket", spec=True, **config)
+    track = LiveStreamVideoStreamTrack("driver")
+
+    packet = self.loop.run_until_complete(track.recv())
+    assert packet.size == len(fake_msg.livestreamDriverEncodeData.header) + len(fake_msg.livestreamDriverEncodeData.data)

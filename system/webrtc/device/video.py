@@ -1,6 +1,7 @@
 import asyncio
 import struct
 import time
+from typing import Any
 
 import av
 from teleoprtc.tracks import TiciVideoStreamTrack
@@ -16,6 +17,54 @@ TIMING_SEI_UUID = bytes([
 
 # EncodeIndex.flags — same as V4L2_BUF_FLAG_KEYFRAME in system/loggerd/encoder/encoder.h
 LIVESTREAM_KEYFRAME_FLAG = 8
+
+
+def _h264_annex_b_has_sps_pps_or_idr(data: bytes) -> bool:
+  """True if Annex-B H.264 contains SPS (7), PPS (8), or IDR slice (5)."""
+  n = len(data)
+  i = 0
+  while i < n:
+    if i + 3 <= n and data[i : i + 3] == b"\x00\x00\x01":
+      sc = 3
+    elif i + 4 <= n and data[i : i + 4] == b"\x00\x00\x00\x01":
+      sc = 4
+    else:
+      i += 1
+      continue
+    pos = i + sc
+    if pos < n and (data[pos] & 0x1F) in (5, 7, 8):
+      return True
+    i = pos
+
+  return False
+
+
+def _livestream_frame_is_decoder_sync_point(idx_flags: int, header: bytes, frame_data: bytes) -> bool:
+  """First RTP must carry something a decoder can sync from (see encoder.cc header + V4L separate mode)."""
+  if idx_flags & LIVESTREAM_KEYFRAME_FLAG:
+    return True
+  if header:
+    return True
+  return _h264_annex_b_has_sps_pps_or_idr(frame_data)
+
+
+def livestream_encode_data_diag(msg: Any) -> dict[str, bool | int | str]:
+  """Compact fields for logging / tools (e.g. body_random_walkd when WebRTC reset times out)."""
+  which = msg.which()
+  evta = getattr(msg, which)
+  idx = evta.idx
+  hdr = bytes(evta.header)
+  dat = bytes(evta.data)
+  frame = hdr + dat
+  return {
+    "which": which,
+    "encode_type": str(idx.type),
+    "flags": int(idx.flags),
+    "header_bytes": len(hdr),
+    "data_bytes": len(dat),
+    "keyframe_bit": bool(idx.flags & LIVESTREAM_KEYFRAME_FLAG),
+    "sync_ok": _livestream_frame_is_decoder_sync_point(idx.flags, hdr, frame),
+  }
 
 
 def _escape_rbsp(data: bytes) -> bytearray:
@@ -82,14 +131,14 @@ class LiveStreamVideoStreamTrack(TiciVideoStreamTrack):
 
       evta = getattr(msg, msg.which())
       idx = evta.idx
-      if self._need_keyframe and not (idx.flags & LIVESTREAM_KEYFRAME_FLAG):
-        continue
-
-      frame_data = evta.header + evta.data
+      hdr = bytes(evta.header)
+      frame_data = hdr + bytes(evta.data)
       if not frame_data:
         continue
 
       if self._need_keyframe:
+        if not _livestream_frame_is_decoder_sync_point(idx.flags, hdr, frame_data):
+          continue
         self._need_keyframe = False
 
       if self.timing_sei_enabled:
