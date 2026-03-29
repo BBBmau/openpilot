@@ -74,6 +74,44 @@ _DEBUG = os.environ.get("BODY_RANDOM_WALK_DEBUG", "").strip().lower() in ("1", "
 _PIPELINE_BURST = os.environ.get("BODY_RANDOM_WALK_PIPELINE_BURST", "").strip().lower() in ("1", "true", "yes")
 
 
+def _patch_aiortc_rtx_bug() -> None:
+  """
+  aiortc <=1.10.1: after unwrapping an RTX retransmission packet, ``_handle_rtp_packet`` still
+  passes the ``video/rtx`` codec to the decoder thread which crashes with
+  ``ValueError: No decoder found for MIME type 'video/rtx'``.
+  Fixed upstream in https://github.com/aiortc/aiortc/pull/1260 (one-line fix).
+
+  We apply the same fix by patching the installed ``rtcrtpreceiver.py`` source at import time.
+  """
+  try:
+    import aiortc.rtcrtpreceiver as mod  # noqa: PLC0415
+    import inspect  # noqa: PLC0415
+
+    src = inspect.getsource(mod.RTCRtpReceiver._handle_rtp_packet)
+    if "codec = self.__codecs[apt]" in src or "codec = self._RTCRtpReceiver__codecs[apt]" in src:
+      return
+    if "unwrap_rtx" not in src:
+      return
+
+    # Patch the source file directly (same machine, same interpreter)
+    import pathlib  # noqa: PLC0415
+
+    path = pathlib.Path(inspect.getfile(mod))
+    text = path.read_text()
+    old = "            packet = unwrap_rtx(packet, payload_type=apt, ssrc=original_ssrc)\n"
+    new = (
+      "            packet = unwrap_rtx(packet, payload_type=apt, ssrc=original_ssrc)\n"
+      "            codec = self.__codecs[apt]\n"
+    )
+    if old in text and "codec = self.__codecs[apt]" not in text:
+      path.write_text(text.replace(old, new))
+      cloudlog.info("body_random_walkd: patched aiortc rtcrtpreceiver.py RTX bug on disk (%s)", path)
+    else:
+      cloudlog.info("body_random_walkd: aiortc RTX fix already present or source layout changed")
+  except Exception as e:
+    cloudlog.warning("body_random_walkd: aiortc RTX patch failed (may already be fixed): %s", e)
+
+
 def _bodyjim_cameras(params: Params) -> list[str]:
   """Single camera name bodyjim should receive — must match webrtcd's outgoing track (``LivestreamCamera``)."""
   raw = os.environ.get("BODY_RANDOM_WALK_CAMERAS", "").strip()
@@ -334,6 +372,8 @@ def main() -> None:
   human = params.get_bool("BodyRandomWalkHumanRender")
   if not human:
     os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+
+  _patch_aiortc_rtx_bug()
 
   BodyEnv = None
   while BodyEnv is None and not stop:
