@@ -99,14 +99,15 @@ def bodywaked_should_run(started: bool, params: Params, CP: car.CarParams) -> bo
 
 
 def comma_body_stack_should_run(started: bool, params: Params, CP: car.CarParams) -> bool:
-  """Comma body: WebRTC/bridge/random-walk need the same gate as ignition without full onroad.
+  """Comma body: WebRTC/bridge/random-walk run when ignition is on.
 
-  ``deviceState.started`` is false in many \"key on\" cases; ``LiveIgnition`` (panda) matches user
-  expectation so ``webrtcd`` and ``bodyrandomwalkd`` share this gate.
+  Uses _is_body fallback so the stack starts even before card publishes
+  carParams (e.g. wake-word boot).  Checks BodyWakeIgnition in addition to
+  LiveIgnition so software-triggered ignition is recognised immediately.
   """
-  if not CP.notCar:
+  if not _is_body(CP, params):
     return False
-  return started or params.get_bool("LiveIgnition")
+  return started or params.get_bool("LiveIgnition") or params.get_bool("BodyWakeIgnition")
 
 def only_offroad(started: bool, params: Params, CP: car.CarParams) -> bool:
   return not started

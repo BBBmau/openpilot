@@ -600,6 +600,15 @@ async def run_session(
       },
       "input": audio_input,
     },
+    "tools": [
+      {
+        "type": "function",
+        "name": "go_to_sleep",
+        "description": "Shuts down the voice assistant and puts the body to sleep. "
+                       "Call this when the user says goodbye, go to sleep, stop, shut down, or otherwise wants to end the conversation.",
+        "parameters": {"type": "object", "properties": {}},
+      },
+    ],
   }
   if instructions:
     session["instructions"] = instructions
@@ -776,6 +785,21 @@ async def run_session(
         )
       elif typ == "conversation.item.input_audio_transcription.failed":
         print(f"[user speech transcript] FAILED {ev}", file=sys.stderr, flush=True)
+    if typ == "response.function_call_arguments.done":
+      fn_name = ev.get("name", "")
+      call_id = ev.get("call_id", "")
+      if fn_name == "go_to_sleep":
+        LOG.info("go_to_sleep function called by assistant — shutting down")
+        if dc.readyState == "open":
+          try:
+            dc.send(json.dumps({
+              "type": "conversation.item.create",
+              "item": {"type": "function_call_output", "call_id": call_id, "output": '{"status":"ok"}'},
+            }))
+          except Exception:
+            pass
+        stop.set()
+        return
     if typ == "input_audio_buffer.committed" and not server_auto_response:
       _on_input_committed(item_id=ev.get("item_id"))
     elif typ == "response.done":

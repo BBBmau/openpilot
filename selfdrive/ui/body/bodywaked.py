@@ -135,6 +135,9 @@ def main():
     if not sm.updated["rawAudioData"]:
       continue
 
+    if params.get_bool("BodyWakeIgnition"):
+      continue
+
     msg = sm["rawAudioData"]
     if msg.sampleRate != SAMPLE_RATE:
       continue
