@@ -80,7 +80,7 @@ def only_onroad(started: bool, params: Params, CP: car.CarParams) -> bool:
 
 def micd_onroad_or_body(started: bool, params: Params, CP: car.CarParams) -> bool:
   """Comma body needs the mic while nominally offroad so wake-word can bring the UI 'onroad'."""
-  return started or _is_body(CP, params)
+  return started or _is_body(CP, params) or params.get_bool("BodyWakeWordEnabled")
 
 
 def soundd_should_run(started: bool, params: Params, CP: car.CarParams) -> bool:
@@ -95,7 +95,7 @@ def soundd_should_run(started: bool, params: Params, CP: car.CarParams) -> bool:
 
 
 def bodywaked_should_run(started: bool, params: Params, CP: car.CarParams) -> bool:
-  return _is_body(CP, params) and params.get_bool("BodyWakeWordEnabled")
+  return params.get_bool("BodyWakeWordEnabled")
 
 
 def comma_body_stack_should_run(started: bool, params: Params, CP: car.CarParams) -> bool:
