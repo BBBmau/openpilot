@@ -30,7 +30,11 @@ void VideoEncoder::publisher_publish(int segment_num, uint32_t idx, VisionIpcBuf
   edat.adoptData(msg.getOrphanage().referenceExternalData(dat));
   edat.setWidth(out_width);
   edat.setHeight(out_height);
-  if (flags & V4L2_BUF_FLAG_KEYFRAME) edat.setHeader(header);
+  const bool send_codec_header = header.size() > 0 &&
+      ((flags & V4L2_BUF_FLAG_KEYFRAME) != 0 || encoder_info.repeat_codec_header);
+  if (send_codec_header) {
+    edat.setHeader(header);
+  }
 
   uint32_t bytes_size = capnp::computeSerializedSizeInWords(msg) * sizeof(capnp::word);
   if (msg_cache.size() < bytes_size) {

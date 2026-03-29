@@ -57,6 +57,10 @@ public:
   const char *thumbnail_name = NULL;
   const char *filename = NULL;
   bool record = true;
+  // When true, publish SPS/PPS (``header`` from V4L CODECCONFIG) on every frame, not only when
+  // ``V4L2_BUF_FLAG_KEYFRAME`` is set. Some MSM VIDC builds omit the keyframe bit; without
+  // ``EncodeData.header`` subscribers never get codec config (see ``encoder.cc`` / WebRTC livestream).
+  bool repeat_codec_header = false;
   bool include_audio = false;
   int frame_width = -1;
   int frame_height = -1;
@@ -102,6 +106,7 @@ const EncoderInfo main_driver_encoder_info = {
 const EncoderInfo stream_wide_road_encoder_info = {
   .publish_name = "livestreamWideRoadEncodeData",
   .record = false,
+  .repeat_codec_header = true,
   .get_settings = [](int){return EncoderSettings::StreamEncoderSettings();},
   INIT_ENCODE_FUNCTIONS(LivestreamWideRoadEncode),
 };
@@ -109,6 +114,7 @@ const EncoderInfo stream_wide_road_encoder_info = {
 const EncoderInfo stream_driver_encoder_info = {
   .publish_name = "livestreamDriverEncodeData",
   .record = false,
+  .repeat_codec_header = true,
   .get_settings = [](int){return EncoderSettings::StreamEncoderSettings();},
   INIT_ENCODE_FUNCTIONS(LivestreamDriverEncode),
 };

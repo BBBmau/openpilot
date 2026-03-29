@@ -271,9 +271,10 @@ def _log_livestream_pipeline_diagnosis(cameras: list[str], params: Params) -> No
     )
     cloudlog.warning(
       "body_random_walkd: pipeline: first frame which=%s encodeType=%s flags=0x%x keyframe_bit=%s "
-      "header=%dB data=%dB slice_has_start_code=%s track_sync_ok=%s — slice_has_start_code=False is "
-      "normal for V4L separate-header mode; LiveStreamVideoStreamTrack prepends 0x00000001 before WebRTC. "
-      "If reset still fails with sync_ok, check ICE/SDP and bodyjim decode.",
+      "header=%dB data=%dB slice_has_start_code=%s track_sync_ok=%s — if header=0 and track_sync_ok=False "
+      "on P-frames, stream_encoderd may not be publishing SPS/PPS (see encoder.cc + "
+      "repeat_codec_header for livestream). If slice_has_start_code=False with header, V4L often omits "
+      "SC before slice; video.py prepends 0x00000001 for WebRTC.",
       diag["which"],
       diag["encode_type"],
       diag["flags"],
